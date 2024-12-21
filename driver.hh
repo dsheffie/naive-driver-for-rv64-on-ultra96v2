@@ -27,9 +27,6 @@ class Driver
     this->paddr = paddr;
     uintptr_t pgsize = sysconf(_SC_PAGESIZE);
     size_t memsize = 16*1024*1024;
-
-    printf("opening interface at %p\n", (void*)paddr);
-
     int fd = open("/dev/mem", O_RDWR | O_SYNC);
     assert(fd != -1);
 

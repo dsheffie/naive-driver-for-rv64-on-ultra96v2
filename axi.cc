@@ -176,8 +176,10 @@ void read_bbl(const char *fn, char *mem) {
 #define WRITE_WORD(EA,WORD) { *reinterpret_cast<uint32_t*>(c_addr + EA) = WORD; }
 
 int main(int argc, char *argv[]) {
+  if(argc != 2)
+    return -1;
   uintptr_t pgsize = sysconf(_SC_PAGESIZE);
-  size_t memsize = 1*1024*1024;
+  size_t memsize = 256*1024*1024;
   int fd = open("/dev/mem", O_RDWR | O_SYNC);
   assert(fd != -1);
   
@@ -190,67 +192,65 @@ int main(int argc, char *argv[]) {
 		     fd,
 		     PHYS_ADDR);
   assert(vaddr != MAP_FAILED);
-  char *c_addr = reinterpret_cast<char*>(vaddr);
-  int *fpga_mem = ((int*)vaddr);
-  //for(int i = 0 ; i < (memsize/4); i++) {
-  //fpga_mem[i] = 0x13;
-  //}
-
+  uint8_t *c_addr = reinterpret_cast<uint8_t*>(vaddr);
+  memset(vaddr, 0x00, memsize);
   
-  int i_pc = 0x1000;
-  int64_t fdt_addr = 0x1000 + (8 * 8);
-
-  read_bbl("bbl.bin", (char*)vaddr);
-  WRITE_WORD(0x1000, 0x297 + 0x10000 - 0x1000);
-  WRITE_WORD(0x1004, 0x597); //1
-  WRITE_WORD(0x1008, 0x58593 + ((fdt_addr - 4) << 20)); //2
-  WRITE_WORD(0x100c, 0xf1402573); //3
-  WRITE_WORD(0x1010, 0x00028067); //4 
-				      
-   d = new Driver(control);
-   d->write32(CONTROL_REG, 0);
-   d->write32(4, 1);
-   d->write32(4, 0);
-
-   d->write32(6,PHYS_ADDR);
-   d->write32(8, memsize-1);
-
-   d->write32(PC_REG, 0x1000);
-   __builtin___clear_cache((char*)vaddr, ((char*)vaddr) + memsize);
-   
-   rvstatus rs(d->read32(0xa));
-   while(true) {
+  uint64_t i_pc = loadState(c_addr, argv[1]);
+  d = new Driver(control);
+  d->write32(CONTROL_REG, 0);
+  d->write32(4, 1);
+  d->write32(4, 0);
+  
+  d->write32(6,PHYS_ADDR);
+  d->write32(8, memsize-1);
+  
+  d->write32(PC_REG, i_pc);
+  __builtin___clear_cache((char*)vaddr, ((char*)vaddr) + memsize);
+  
+  rvstatus rs(d->read32(0xa));
+  while(true) {
     rs.u = d->read32(0xa);
     if(rs.s.ready) {
       break;
     }
   }
    
-   //#define DO_STEP
-   uint32_t cr = 8 | 2;
-   //cr |= STEP_MASK;
+  //#define DO_STEP
+  uint32_t cr = 8 | 2;
+
+  if(getenv("STEP") != nullptr) {
+    cr |= STEP_MASK;
+  }
 
    /* let the games begin */
    d->write32(4, cr);
 
   int steps = 0;
-  uint64_t ss = 0;
+  uint64_t ss = 0, zz = 0;
+  
   while(1) {
-    if(ss > (1UL<<28)) {
-      break;
-    }
+    //rs.u = d->read32(0xa);
+    //if(cpu_stopped(rs)) {
+    //break;
+    //}
+    //if(ss > (1UL<<24)) {
+    //break;
+    //}
     ss++;
-    int v = d->read32(0x3a) & 255;
-    int wptr =v&0xf, rptr = (v>>4)&0xf;
-    if(wptr != rptr) {
-      int c = d->read32(0x3b);	
-      printf("%c", c==0 ? '\n' : c);
-      //printf("%c, w %d, r %d\n", c, wptr, rptr);
-      std::fflush(nullptr);
-      d->write32(0x3a, 1);
-      d->write32(0x3a, 0);
-      ss = 0;
-    }    
+    zz++;
+    int v = 0;
+    if((zz&1023) == 0) {
+      v = d->read32(0x3a) & 255;
+      int wptr =v&0xf, rptr = (v>>4)&0xf;
+      if(wptr != rptr) {
+	int c = d->read32(0x3b);	
+	printf("%c", c==0 ? '\n' : c);
+	//printf("%c, w %d, r %d\n", c, wptr, rptr);
+	std::fflush(nullptr);
+	d->write32(0x3a, 1);
+	d->write32(0x3a, 0);
+      }
+    }
 
     if(cr & STEP_MASK) {
       int state = get_axi_state();
@@ -261,19 +261,20 @@ int main(int argc, char *argv[]) {
       ss = 0;
       uint32_t cr_ = cr | STEP_ACK;
       d->write32(4, cr_);
-#if 0
+#if 1
+      uint64_t disp = (d->read32(0x8) - PHYS_ADDR);
       std::cout
 	<< "state " << state
-	<< " addr " << std::hex << (d->read32(0x8) & (memsize-1))
+	<< " addr " << std::hex << (disp)
 	<< " data " << d->read32(0x9)
+	<< " pc " << d->read32(7)
 	<< std::dec 
 	<< " txns " << d->read32(1)
+	<< " step " << steps
 	<< "\n";
 #endif
-      //report_status();
       //cr &= (~STEP_MASK);
       d->write32(4, cr);
-      
       steps++;
     }
     
@@ -295,6 +296,6 @@ int main(int argc, char *argv[]) {
   //exit(-1);
   //signal(SIGINT, sigintHandler);
 
-  munmap(fpga_mem, memsize);
+  munmap(c_addr, memsize);
   return 0;
 }
