@@ -145,13 +145,23 @@ static inline void report_status() {
     std::cout << "axi state = " << ((states>>18) & 7) << "\n";
     std::cout << rs << "\n";
   }
+}
 
+static uint64_t char_pos = 0, char_buf_sz = 0;
+static char *log_buf = nullptr;
+
+void dumplog() {
+  if(log_buf != nullptr) {
+    FILE *fp = fopen("output.txt", "w");
+    assert(fp);
+    fwrite(log_buf, 1, char_pos, fp);
+    fclose(fp);
+  }
 }
 
 void sigintHandler(int id) {
   report_status();
-  std::cout << "mem_ops = " << mem_ops << "\n";
-  std::cout << "zz = " << zz << "\n";
+  dumplog();
   exit(-1);
 }
 
@@ -171,6 +181,33 @@ void read_bbl(const char *fn, char *mem) {
   }
   munmap(buf, s.st_size);
   close(fd);
+}
+
+static inline bool read_char_fifo() {
+  int v = d->read32(0x3a) & 255;
+  int wptr =v&0xf, rptr = (v>>4)&0xf;
+  if(wptr == rptr) {
+    return false;
+  }
+  int c = d->read32(0x3b);	
+  printf("%c", c==0 ? '\n' : c);
+  if(char_pos == char_buf_sz) {
+    size_t n_sz = std::max(1024UL, 2*char_buf_sz);
+    char *t = new char[n_sz];
+    if(log_buf != nullptr) {
+      memset(t, 0, n_sz);
+      memcpy(t, log_buf, char_buf_sz);
+    }
+    char_buf_sz = n_sz;
+    free(log_buf);
+    log_buf = t;
+  }
+  //printf("char_pos = %lu, char_buf_sz = %lu\n", char_pos, char_buf_sz);
+  log_buf[char_pos++] = c==0 ? '\n' : c;
+  std::fflush(nullptr);
+  d->write32(0x3a, 1);
+  d->write32(0x3a, 0);
+  return true;
 }
 
 #define WRITE_WORD(EA,WORD) { *reinterpret_cast<uint32_t*>(c_addr + EA) = WORD; }
@@ -206,6 +243,8 @@ int main(int argc, char *argv[]) {
   
   d->write32(PC_REG, i_pc);
   __builtin___clear_cache((char*)vaddr, ((char*)vaddr) + memsize);
+
+  usleep(1000);
   
   rvstatus rs(d->read32(0xa));
   while(true) {
@@ -214,7 +253,15 @@ int main(int argc, char *argv[]) {
       break;
     }
   }
-   
+  // volatile char* fdt_magic = (volatile char*)(c_addr + 0x0);
+  // for(int i =0; i < memsize; i++) {
+  //   if(fdt_magic[0] == 0xed && fdt_magic[1] == 0xfe && fdt_magic[2] == 0x0d) {
+  //     printf("fdt_magic found at %x\n", i);     
+  //   }
+  //   fdt_magic++;
+  // }
+  signal(SIGINT, sigintHandler);
+  
   //#define DO_STEP
   uint32_t cr = 8 | 2;
 
@@ -229,29 +276,17 @@ int main(int argc, char *argv[]) {
   uint64_t ss = 0, zz = 0;
   
   while(1) {
-    //rs.u = d->read32(0xa);
-    //if(cpu_stopped(rs)) {
-    //break;
-    //}
-    //if(ss > (1UL<<24)) {
-    //break;
-    //}
     ss++;
     zz++;
-    int v = 0;
     if((zz&1023) == 0) {
-      v = d->read32(0x3a) & 255;
-      int wptr =v&0xf, rptr = (v>>4)&0xf;
-      if(wptr != rptr) {
-	int c = d->read32(0x3b);	
-	printf("%c", c==0 ? '\n' : c);
-	//printf("%c, w %d, r %d\n", c, wptr, rptr);
-	std::fflush(nullptr);
-	d->write32(0x3a, 1);
-	d->write32(0x3a, 0);
-      }
+      read_char_fifo();
     }
 
+    //if(zz == (1UL<<24)) {
+    //dumplog();
+    // exit(-1);
+    //}
+    
     if(cr & STEP_MASK) {
       int state = get_axi_state();
       if(not(state == 5 || state == 6)) {
@@ -296,6 +331,9 @@ int main(int argc, char *argv[]) {
   //exit(-1);
   //signal(SIGINT, sigintHandler);
 
+
+  //printf("fdt_magic = %x\n", *fdt_magic);
+  
   munmap(c_addr, memsize);
   return 0;
 }

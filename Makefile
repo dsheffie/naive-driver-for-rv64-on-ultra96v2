@@ -1,7 +1,7 @@
 OBJ = axi.o loadelf.o helper.o saveState.o
 CXX = g++
 EXE = axi
-OPT = -O2
+OPT = -O3
 CXXFLAGS = -std=c++11 -g $(OPT)
 DEP = $(OBJ:.o=.d)
 
