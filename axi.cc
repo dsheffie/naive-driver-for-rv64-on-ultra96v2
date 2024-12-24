@@ -136,6 +136,7 @@ static inline int get_axi_state() {
 static inline void report_status() {
   if(d) {
     uint64_t txns = read64(d, 0x3c);
+    uint64_t lat = read64(d, 0x3e);
     uint32_t states = d->read32(0xd);    
     rvstatus rs(d->read32(0xa));
     std::cout << "core state = " << (states & 31) << "\n";
@@ -144,6 +145,9 @@ static inline void report_status() {
     std::cout << "l1d state = " << ((states>>14) & 15) << "\n";
     std::cout << "axi state = " << ((states>>18) & 7) << "\n";
     std::cout << rs << "\n";
+    std::cout << "txns = " << txns << "\n";
+    std::cout << "lat = " << lat << "\n";
+    std::cout << "avg lat = " << static_cast<double>(lat)/txns << "\n";
   }
 }
 
@@ -244,10 +248,11 @@ int main(int argc, char *argv[]) {
   d->write32(PC_REG, i_pc);
   __builtin___clear_cache((char*)vaddr, ((char*)vaddr) + memsize);
 
-  usleep(1000);
+  //usleep(1000);
   
-  rvstatus rs(d->read32(0xa));
+  rvstatus rs(0);
   while(true) {
+    __sync_synchronize();
     rs.u = d->read32(0xa);
     if(rs.s.ready) {
       break;
@@ -268,8 +273,9 @@ int main(int argc, char *argv[]) {
   if(getenv("STEP") != nullptr) {
     cr |= STEP_MASK;
   }
-
-   /* let the games begin */
+  __sync_synchronize();
+  
+  /* let the games begin */
    d->write32(4, cr);
 
   int steps = 0;
