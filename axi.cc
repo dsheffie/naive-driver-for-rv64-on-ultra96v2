@@ -151,6 +151,7 @@ static inline void report_status() {
   }
 }
 
+#define MAX_LOG (1UL<<22)
 static uint64_t char_pos = 0, char_buf_sz = 0;
 static char *log_buf = nullptr;
 
@@ -196,15 +197,20 @@ static inline bool read_char_fifo() {
   int c = d->read32(0x3b);	
   printf("%c", c==0 ? '\n' : c);
   if(char_pos == char_buf_sz) {
-    size_t n_sz = std::max(1024UL, 2*char_buf_sz);
-    char *t = new char[n_sz];
-    if(log_buf != nullptr) {
-      memset(t, 0, n_sz);
-      memcpy(t, log_buf, char_buf_sz);
+    if(char_buf_sz == MAX_LOG) {
+      char_pos = 0;
     }
-    char_buf_sz = n_sz;
-    free(log_buf);
-    log_buf = t;
+    else {
+      size_t n_sz = std::max(1024UL, 2*char_buf_sz);
+      char *t = new char[n_sz];
+      if(log_buf != nullptr) {
+	memset(t, 0, n_sz);
+	memcpy(t, log_buf, char_buf_sz);
+      }
+      char_buf_sz = n_sz;
+      free(log_buf);
+      log_buf = t;
+    }
   }
   //printf("char_pos = %lu, char_buf_sz = %lu\n", char_pos, char_buf_sz);
   log_buf[char_pos++] = c==0 ? '\n' : c;
