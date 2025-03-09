@@ -13,8 +13,8 @@
 #include <sys/stat.h>
 #include <sys/times.h>
 #include <unistd.h>
-#include <arm_neon.h>
 
+#include <regex>
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -40,7 +40,7 @@ bool globals::log;
 std::map<std::string, uint32_t> globals::symtab;
 
 static const uint32_t control = 0xA0050000;
-//static const uint32_t control = 0xA0000000;
+static const uint64_t disk_addr = (384+32)*1024UL*1024UL;
 
 #define PHYS_ADDR 0x60100000
 #define CONTROL_REG 0
@@ -150,9 +150,9 @@ static inline void report_status() {
     std::cout << "avg lat = " << static_cast<double>(lat)/txns << "\n";
   }
 }
-
+#define POLL_FREQ ((1UL<<12)-1)
 #define MAX_LOG (1UL<<22)
-static uint64_t char_pos = 0, char_buf_sz = 0;
+static uint64_t char_pos = 0, char_buf_sz = 0, char_line_start = 0;
 static char *log_buf = nullptr;
 
 void dumplog() {
@@ -171,24 +171,7 @@ void sigintHandler(int id) {
 }
 
 
-
-void read_bbl(const char *fn, char *mem) {
-  int fd, rc;
-  char *buf;
-  struct stat s;
-  fd = open(fn, O_RDONLY);
-  rc = fstat(fd,&s);
-  buf = (char*)mmap(nullptr, s.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-  assert(buf != reinterpret_cast<void*>(-1L));
-
-  for(size_t i = 0; i < s.st_size; i++) {
-    mem[0x10000+i] = buf[i];
-  }
-  munmap(buf, s.st_size);
-  close(fd);
-}
-
-static inline bool read_char_fifo() {
+static inline bool read_char_fifo(bool &done) {
   int v = d->read32(0x3a) & 255;
   int wptr =v&0xf, rptr = (v>>4)&0xf;
   if(wptr == rptr) {
@@ -196,6 +179,7 @@ static inline bool read_char_fifo() {
   }
   int c = d->read32(0x3b);	
   printf("%c", c==0 ? '\n' : c);
+
   if(char_pos == char_buf_sz) {
     if(char_buf_sz == MAX_LOG) {
       char_pos = 0;
@@ -214,6 +198,16 @@ static inline bool read_char_fifo() {
   }
   //printf("char_pos = %lu, char_buf_sz = %lu\n", char_pos, char_buf_sz);
   log_buf[char_pos++] = c==0 ? '\n' : c;
+  if(c==0 or c == '\n') {
+    char *l = log_buf+char_line_start;
+    size_t len = strlen(l);
+    int m = strncmp("fpga_done", l, 9);
+    //printf("len = %zu, m = %d, %s \n", len, m, l);
+    if(m == 0) {
+      done = true;
+    }
+    char_line_start = char_pos;
+  }
   std::fflush(nullptr);
   d->write32(0x3a, 1);
   d->write32(0x3a, 0);
@@ -226,7 +220,7 @@ int main(int argc, char *argv[]) {
   if(argc != 2)
     return -1;
   uintptr_t pgsize = sysconf(_SC_PAGESIZE);
-  size_t memsize = 256*1024*1024;
+  size_t memsize = 448*1024*1024;
   int fd = open("/dev/mem", O_RDWR | O_SYNC);
   assert(fd != -1);
   
@@ -264,13 +258,7 @@ int main(int argc, char *argv[]) {
       break;
     }
   }
-  // volatile char* fdt_magic = (volatile char*)(c_addr + 0x0);
-  // for(int i =0; i < memsize; i++) {
-  //   if(fdt_magic[0] == 0xed && fdt_magic[1] == 0xfe && fdt_magic[2] == 0x0d) {
-  //     printf("fdt_magic found at %x\n", i);     
-  //   }
-  //   fdt_magic++;
-  // }
+
   signal(SIGINT, sigintHandler);
   
   //#define DO_STEP
@@ -286,19 +274,24 @@ int main(int argc, char *argv[]) {
 
   int steps = 0;
   uint64_t ss = 0, zz = 0;
-  
-  while(1) {
+  bool done = false;
+  int us_amt = 1;
+  while(not(done)) {
     ss++;
     zz++;
-    if((zz&1023) == 0) {
-      read_char_fifo();
-    }
-
-    //if(zz == (1UL<<24)) {
-    //dumplog();
-    // exit(-1);
-    //}
     
+    if((zz&POLL_FREQ) == 0) {
+      bool new_c = read_char_fifo(done);
+      if(not(new_c)) {
+	usleep(us_amt);
+	us_amt = std::min(us_amt+1, 100);
+      }
+      else {
+	us_amt = 1;
+      }
+    }
+    
+#if 0
     if(cr & STEP_MASK) {
       int state = get_axi_state();
       if(not(state == 5 || state == 6)) {
@@ -324,9 +317,18 @@ int main(int argc, char *argv[]) {
       d->write32(4, cr);
       steps++;
     }
+#endif
     
     //printf("steps = %d\n", steps);
   }
+
+
+  // {
+  //   uint8_t *buf = c_addr+disk_addr;    
+  //   int fd = ::open("disk.img", O_RDWR|O_CREAT|O_TRUNC, 0600);
+  //   write(fd, buf, 16*1024*1024);
+  //   close(fd);
+  // }
   
 
   printf("last pc %x\n", d->read32(7));    
@@ -343,7 +345,7 @@ int main(int argc, char *argv[]) {
   //exit(-1);
   //signal(SIGINT, sigintHandler);
 
-
+  dumplog();
   //printf("fdt_magic = %x\n", *fdt_magic);
   
   munmap(c_addr, memsize);
