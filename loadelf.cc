@@ -12,13 +12,11 @@
 #include <cstdint>
 #include <list>
 #include <map>
+#include <elf.h>
 
 #include "helper.hh"
 #include "interpret.hh"
-#include "globals.hh"
 #include "loadelf.hh"
-
-#include <elf.h>
 
 static const uint8_t magicArr[4] = {0x7f, 'E', 'L', 'F'};
 
@@ -132,39 +130,7 @@ uint32_t load_elf(const char* fn, uint8_t *mem) {
 	     sizeof(uint8_t)*p_filesz);
     }
   }
-  
-  for(int32_t i = 0; i < e_shnum; i++, sh32++) {
-    if (sh32->sh_type & SHT_NOBITS) {
-      continue;
-    }
-    if (strcmp(shstrtab + sh32->sh_name, ".strtab") == 0) {
-      strtabidx = i;
-    }
-    if (strcmp(shstrtab + sh32->sh_name, ".symtab") == 0) {
-      symtabidx = i;
-    }
-  }
-  
   /* this code is all basically from elfloader.cc */
-  if(strtabidx && symtabidx) {
-    sh32 = reinterpret_cast<Elf64_Shdr*>(buf + eh32->e_shoff);    
-    char* strtab = buf + sh32[strtabidx].sh_offset;
-    Elf64_Sym* sym = reinterpret_cast<Elf64_Sym*>(buf + sh32[symtabidx].sh_offset);
-    for(int32_t i = 0; i < (sh32[symtabidx].sh_size / sizeof(Elf64_Sym)); i++) {
-      globals::symtab[strtab + sym[i].st_name] = static_cast<uint32_t>(sym[i].st_value);
-    }
-  }
   munmap(buf, s.st_size);
-
-  if(globals::symtab.find("tohost") != globals::symtab.end() ){
-    globals::tohost_addr = globals::symtab.at("tohost");
-  }
-  if(globals::symtab.find("fromhost") != globals::symtab.end() ){
-    globals::fromhost_addr = globals::symtab.at("fromhost");
-  }
-
-#define WRITE_WORD(EA,WORD) { *reinterpret_cast<uint32_t*>(mem + EA) = WORD; }
-
-
   return pc;
 }

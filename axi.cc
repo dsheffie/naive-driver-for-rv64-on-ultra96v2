@@ -24,32 +24,26 @@
 #include "helper.hh"
 #include "driver.hh"
 #include "loadelf.hh"
-#include "globals.hh"
 #include "helper.hh"
 #include "saveState.hh"
 
-#include "syscall.h"
-
-uint32_t globals::tohost_addr;
-uint32_t globals::fromhost_addr;
-
-int globals::sysArgc;
-char **globals::sysArgv;
-bool globals::silent;
-bool globals::log;
-std::map<std::string, uint32_t> globals::symtab;
-
 static const uint32_t control = 0xA0050000;
 static const uint64_t disk_addr = (384+32)*1024UL*1024UL;
+static const uint64_t memsize = 448*(1UL<<20);
 
 #define PHYS_ADDR 0x60100000
 #define CONTROL_REG 0
 #define STATUS_REG 1
 #define RAM_REG 2
 #define PC_REG 5
-
 #define STEP_MASK (1UL<<16)
 #define STEP_ACK (1UL<<31)
+#define POLL_FREQ ((1UL<<12)-1)
+#define MAX_LOG (1UL<<22)
+
+static uint64_t char_pos = 0, char_buf_sz = 0, char_line_start = 0;
+static char *log_buf = nullptr;
+
 
 struct rvstatus_ {
   uint32_t ready : 1;
@@ -134,34 +128,33 @@ static inline int get_axi_state() {
 }
 
 static inline void report_status() {
-  if(d) {
-    uint64_t txns = read64(d, 0x3c);
-    uint64_t lat = read64(d, 0x3e);
-    uint32_t states = d->read32(0xd);    
-    rvstatus rs(d->read32(0xa));
-    std::cout << "core state = " << (states & 31) << "\n";
-    std::cout << "l2 state = " << ((states>>5) & 31) << "\n";
-    std::cout << "l1i state = " << ((states>>10) & 15) << "\n";
-    std::cout << "l1d state = " << ((states>>14) & 15) << "\n";
-    std::cout << "axi state = " << ((states>>18) & 7) << "\n";
-    std::cout << rs << "\n";
-    std::cout << "txns = " << txns << "\n";
-    std::cout << "lat = " << lat << "\n";
-    std::cout << "avg lat = " << static_cast<double>(lat)/txns << "\n";
+  if(d == nullptr) {
+    return;
   }
+  uint64_t txns = read64(d, 0x3c);
+  uint64_t lat = read64(d, 0x3e);
+  uint32_t states = d->read32(0xd);    
+  rvstatus rs(d->read32(0xa));
+  std::cout << "core state = " << (states & 31) << "\n";
+  std::cout << "l2 state = " << ((states>>5) & 31) << "\n";
+  std::cout << "l1i state = " << ((states>>10) & 15) << "\n";
+  std::cout << "l1d state = " << ((states>>14) & 15) << "\n";
+  std::cout << "axi state = " << ((states>>18) & 7) << "\n";
+  std::cout << rs << "\n";
+  std::cout << "txns = " << txns << "\n";
+  std::cout << "lat = " << lat << "\n";
+  std::cout << "avg lat = " << static_cast<double>(lat)/txns << "\n";
 }
-#define POLL_FREQ ((1UL<<12)-1)
-#define MAX_LOG (1UL<<22)
-static uint64_t char_pos = 0, char_buf_sz = 0, char_line_start = 0;
-static char *log_buf = nullptr;
+
 
 void dumplog() {
-  if(log_buf != nullptr) {
-    FILE *fp = fopen("output.txt", "w");
-    assert(fp);
-    fwrite(log_buf, 1, char_pos, fp);
-    fclose(fp);
+  if(log_buf == nullptr) {
+    return;
   }
+  FILE *fp = fopen("output.txt", "w");
+  assert(fp);
+  fwrite(log_buf, 1, char_pos, fp);
+  fclose(fp);
 }
 
 void sigintHandler(int id) {
@@ -214,14 +207,16 @@ static inline bool read_char_fifo(bool &done) {
   return true;
 }
 
-#define WRITE_WORD(EA,WORD) { *reinterpret_cast<uint32_t*>(c_addr + EA) = WORD; }
-
 int main(int argc, char *argv[]) {
+  bool initialize = true;
+  int fd, steps = 0, us_amt = 1;
+  uint64_t i_pc = 0, ss = 0, zz = 0;
+  bool done = false;
+
   if(argc != 2)
     return -1;
-  uintptr_t pgsize = sysconf(_SC_PAGESIZE);
-  size_t memsize = 448*1024*1024;
-  int fd = open("/dev/mem", O_RDWR | O_SYNC);
+  
+  fd = open("/dev/mem", O_RDWR | O_SYNC);
   assert(fd != -1);
   
   int prot = PROT_READ | PROT_WRITE;
@@ -234,47 +229,44 @@ int main(int argc, char *argv[]) {
 		     PHYS_ADDR);
   assert(vaddr != MAP_FAILED);
   uint8_t *c_addr = reinterpret_cast<uint8_t*>(vaddr);
-  memset(vaddr, 0x00, memsize);
-  
-  uint64_t i_pc = loadState(c_addr, argv[1]);
-  d = new Driver(control);
-  d->write32(CONTROL_REG, 0);
-  d->write32(4, 1);
-  d->write32(4, 0);
-  
-  d->write32(6,PHYS_ADDR);
-  d->write32(8, memsize-1);
-  
-  d->write32(PC_REG, i_pc);
-  __builtin___clear_cache((char*)vaddr, ((char*)vaddr) + memsize);
-
-  
-  rvstatus rs(0);
-  while(true) {
-    __sync_synchronize();
-    rs.u = d->read32(0xa);
-    if(rs.s.ready) {
-      break;
-    }
-  }
-
   signal(SIGINT, sigintHandler);
+  d = new Driver(control);
   
+  if(initialize) {
+    memset(vaddr, 0x00, memsize);
+    i_pc = loadState(c_addr, argv[1]);
+    d->write32(CONTROL_REG, 0);
+    d->write32(4, 1);
+    d->write32(4, 0);
+    
+    d->write32(6,PHYS_ADDR);
+    d->write32(8, memsize-1);
+    
+    d->write32(PC_REG, i_pc);
+    __builtin___clear_cache((char*)vaddr, ((char*)vaddr) + memsize);
+    
+    
+    rvstatus rs(0);
+    while(true) {
+      __sync_synchronize();
+      rs.u = d->read32(0xa);
+      if(rs.s.ready) {
+	break;
+      }
+    }
   //#define DO_STEP
-  uint32_t cr = 8 | 2;
-
-  if(getenv("STEP") != nullptr) {
-    cr |= STEP_MASK;
+    uint32_t cr = 8 | 2;
+    
+    if(getenv("STEP") != nullptr) {
+      cr |= STEP_MASK;
+    }
+    __sync_synchronize();
+    
+    /* let the games begin */
+    d->write32(4, cr);
   }
-  __sync_synchronize();
   
-  /* let the games begin */
-   d->write32(4, cr);
 
-  int steps = 0;
-  uint64_t ss = 0, zz = 0;
-  bool done = false;
-  int us_amt = 1;
   while(not(done)) {
     ss++;
     zz++;
@@ -338,14 +330,9 @@ int main(int argc, char *argv[]) {
   std::cout << std::hex << "epc : "
 	    << d->read32(0xb) << std::dec << "\n";
 
-
   std::cout << "last addr " << std::hex << d->read32(0x8) << std::dec << "\n";
   std::cout << "last data " << std::hex << d->read32(0x9) << std::dec << "\n";  
-  //exit(-1);
-  //signal(SIGINT, sigintHandler);
-
   dumplog();
-  //printf("fdt_magic = %x\n", *fdt_magic);
   
   munmap(c_addr, memsize);
   return 0;

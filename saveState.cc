@@ -6,7 +6,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include "interpret.hh"
-#include "globals.hh"
 
 struct page {
   uint32_t va;
