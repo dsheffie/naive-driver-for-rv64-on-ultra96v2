@@ -248,7 +248,6 @@ int main(int argc, char *argv[]) {
   d->write32(PC_REG, i_pc);
   __builtin___clear_cache((char*)vaddr, ((char*)vaddr) + memsize);
 
-  //usleep(1000);
   
   rvstatus rs(0);
   while(true) {
@@ -284,7 +283,7 @@ int main(int argc, char *argv[]) {
       bool new_c = read_char_fifo(done);
       if(not(new_c)) {
 	usleep(us_amt);
-	us_amt = std::min(us_amt+1, 100);
+	us_amt = std::min(us_amt+1, 1000);
       }
       else {
 	us_amt = 1;
