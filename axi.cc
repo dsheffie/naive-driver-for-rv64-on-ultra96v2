@@ -14,12 +14,11 @@
 #include <sys/times.h>
 #include <unistd.h>
 
-#include <regex>
 #include <iostream>
 #include <fstream>
 #include <string>
-#include <bitset>
 #include <map>
+#include <boost/program_options.hpp>
 
 #include "helper.hh"
 #include "driver.hh"
@@ -207,33 +206,50 @@ static inline bool read_char_fifo(bool &done) {
 }
 
 int main(int argc, char *argv[]) {
+  namespace po = boost::program_options; 
   bool initialize = true;
   int fd, steps = 0, us_amt = 1;
   uint64_t i_pc = 0, ss = 0, zz = 0;
   bool done = false;
-
-  if(argc != 2)
+  void *vaddr = nullptr;
+  uint8_t *c_addr = nullptr;
+  std::string chpt_name;
+  po::options_description desc("Options");
+  desc.add_options() 
+    ("help,h", "Print help messages") 
+    ("initialize,i", po::value<bool>(&initialize)->default_value(true), "initialize") 
+    ("file,f", po::value<std::string>(&chpt_name), "checkpoint filename")
+    ;  
+  try {
+    po::variables_map vm;
+    po::store(po::parse_command_line(argc, argv, desc), vm);
+    po::notify(vm); 
+  }
+  catch(po::error &e) {
+    std::cerr << "command-line error : " << e.what() << "\n";
     return -1;
-  
+  }
+  if(chpt_name.size() == 0) {
+    return -1;
+  }
   fd = open("/dev/mem", O_RDWR | O_SYNC);
   assert(fd != -1);
   
-  int prot = PROT_READ | PROT_WRITE;
-  int flags = MAP_SHARED;
-  void* vaddr = mmap(0,
-		     memsize,
-		     prot,
-		     flags,
-		     fd,
-		     PHYS_ADDR);
+  vaddr = mmap(0,
+	       memsize,
+	       PROT_READ|PROT_WRITE,
+	       MAP_SHARED,
+	       fd,
+	       PHYS_ADDR);
   assert(vaddr != MAP_FAILED);
-  uint8_t *c_addr = reinterpret_cast<uint8_t*>(vaddr);
+  c_addr = reinterpret_cast<uint8_t*>(vaddr);
+  
   signal(SIGINT, sigintHandler);
   d = new Driver(control);
   
   if(initialize) {
     memset(vaddr, 0x00, memsize);
-    i_pc = loadState(c_addr, argv[1]);
+    i_pc = loadState(c_addr, chpt_name.c_str());
     d->write32(CONTROL_REG, 0);
     d->write32(4, 1);
     d->write32(4, 0);

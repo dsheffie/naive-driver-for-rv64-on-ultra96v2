@@ -4,7 +4,7 @@ EXE = axi
 OPT = -O3
 CXXFLAGS = -std=c++11 -g $(OPT)
 DEP = $(OBJ:.o=.d)
-
+LIBS = -lboost_program_options
 .PHONY: all clean
 
 all: $(EXE)
