@@ -1,4 +1,4 @@
-OBJ = axi.o loadelf.o helper.o saveState.o
+OBJ = axi.o helper.o saveState.o
 CXX = g++
 EXE = axi
 OPT = -O3
