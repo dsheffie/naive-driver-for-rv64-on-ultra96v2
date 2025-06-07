@@ -142,6 +142,10 @@ static inline void report_status() {
   std::cout << "txns = " << txns << "\n";
   std::cout << "lat = " << lat << "\n";
   std::cout << "avg lat = " << static_cast<double>(lat)/txns << "\n";
+  std::cout << "axi busy cycles = " << read64(d, 16) << "\n";
+  std::cout << "cycles = " << read64(d, 0x2a) << "\n";
+  std::cout << "icnt = " << read64(d, 0x28) << "\n";  
+  
 }
 
 
@@ -161,6 +165,8 @@ void sigintHandler(int id) {
   exit(-1);
 }
 
+static const char* linux_version = "Linux version";
+static bool linux_started = false;
 
 static inline bool read_char_fifo(bool &done) {
   int v = d->read32(0x3a) & 255;
@@ -197,6 +203,10 @@ static inline bool read_char_fifo(bool &done) {
     if(m == 0) {
       done = true;
     }
+    m = strncmp(linux_version, l, sizeof(linux_version)-1);
+    if(m == 0) {
+      linux_started = true;
+    }
     char_line_start = char_pos;
   }
   std::fflush(nullptr);
@@ -210,7 +220,7 @@ int main(int argc, char *argv[]) {
   bool initialize = true;
   int fd, steps = 0, us_amt = 1;
   uint64_t i_pc = 0, ss = 0, zz = 0;
-  bool done = false;
+  bool done = false, do_linux_check = true;
   void *vaddr = nullptr;
   uint8_t *c_addr = nullptr;
   std::string chpt_name;
@@ -219,6 +229,7 @@ int main(int argc, char *argv[]) {
     ("help,h", "Print help messages") 
     ("initialize,i", po::value<bool>(&initialize)->default_value(true), "initialize") 
     ("file,f", po::value<std::string>(&chpt_name), "checkpoint filename")
+    ("linux", po::value<bool>(&do_linux_check)->default_value(false), "running linux")
     ;  
   try {
     po::variables_map vm;
@@ -280,14 +291,23 @@ int main(int argc, char *argv[]) {
     /* let the games begin */
     d->write32(4, cr);
   }
+  else {
+    linux_started = true;
+  }
   
-
+  uint64_t total_us = 0;
+  
   while(not(done)) {
     ss++;
     zz++;
     
     if((zz&POLL_FREQ) == 0) {
+      total_us += us_amt;
       bool new_c = read_char_fifo(done);
+      if(do_linux_check and (total_us > (1UL<<20)) and not(linux_started)) {
+	printf("linux kernel not yet started???\n");
+	done = true;
+      }
       if(not(new_c)) {
 	usleep(us_amt);
 	us_amt = std::min(us_amt+1, 1000);
@@ -346,7 +366,10 @@ int main(int argc, char *argv[]) {
 	    << d->read32(0xb) << std::dec << "\n";
 
   std::cout << "last addr " << std::hex << d->read32(0x8) << std::dec << "\n";
-  std::cout << "last data " << std::hex << d->read32(0x9) << std::dec << "\n";  
+  std::cout << "last data " << std::hex << d->read32(0x9) << std::dec << "\n";
+
+
+  
   dumplog();
   
   munmap(c_addr, memsize);
