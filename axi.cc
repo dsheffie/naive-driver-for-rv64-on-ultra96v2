@@ -41,6 +41,8 @@ static const uint64_t memsize = 448*(1UL<<20);
 
 static uint64_t char_pos = 0, char_buf_sz = 0, char_line_start = 0;
 static char *log_buf = nullptr;
+static bool dump_mem = false;
+static uint8_t *c_addr = nullptr;
 
 
 struct rvstatus_ {
@@ -159,9 +161,45 @@ void dumplog() {
   fclose(fp);
 }
 
+
+typedef unsigned char Rgb[3];
+struct color {
+    uint32_t b:8;
+    uint32_t g:8;
+    uint32_t r:8;
+    uint32_t a:8;
+};
+
+
 void sigintHandler(int id) {
   report_status();
   dumplog();
+  if(dump_mem and (c_addr != nullptr)) {
+    const int width = 320, height = 200;
+    Rgb *framebuffer = new Rgb[width * height];
+    color *pixels = reinterpret_cast<color*>(c_addr+0x6000000);
+    
+    for(int h = 0, i=0; h < height; h++) {
+      for(int w = 0; w < width; w++) {
+	framebuffer[i][0] = pixels[h*width + w].r;
+	framebuffer[i][1] = pixels[h*width + w].g;
+	framebuffer[i][2] = pixels[h*width + w].b;
+	i++;
+      }
+    }
+    
+    std::ofstream ofs;
+    ofs.open("./raster2d.ppm");
+    ofs << "P6\n" << width << " " << height << "\n255\n";
+    ofs.write((char*)framebuffer, width * height * 3);
+    ofs.close();
+    
+    delete [] framebuffer;
+    
+    //int fd =  ::open("dump.bin", O_RDWR|O_CREAT|O_TRUNC, 0600);
+    //write(fd, c_addr+0x6000000, 320*200*4);
+    //close(fd);
+  }
   exit(-1);
 }
 
@@ -222,13 +260,13 @@ int main(int argc, char *argv[]) {
   uint64_t i_pc = 0, ss = 0, zz = 0;
   bool done = false, do_linux_check = true;
   void *vaddr = nullptr;
-  uint8_t *c_addr = nullptr;
   std::string chpt_name;
   po::options_description desc("Options");
   desc.add_options() 
     ("help,h", "Print help messages") 
     ("initialize,i", po::value<bool>(&initialize)->default_value(true), "initialize") 
     ("file,f", po::value<std::string>(&chpt_name), "checkpoint filename")
+    ("dump,d", po::value<bool>(&dump_mem)->default_value(false), "dump phys mem on exit")
     ("linux", po::value<bool>(&do_linux_check)->default_value(false), "running linux")
     ;  
   try {
