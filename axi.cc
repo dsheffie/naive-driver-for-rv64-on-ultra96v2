@@ -20,6 +20,9 @@
 #include <map>
 #include <boost/program_options.hpp>
 
+#include <SDL2/SDL.h>
+
+
 #include "helper.hh"
 #include "driver.hh"
 #include "helper.hh"
@@ -28,6 +31,15 @@
 static const uint32_t control = 0xA0050000;
 static const uint64_t disk_addr = (384+32)*1024UL*1024UL;
 static const uint64_t memsize = 448*(1UL<<20);
+
+struct color {
+    uint32_t b:8;
+    uint32_t g:8;
+    uint32_t r:8;
+    uint32_t a:8;
+};
+
+
 
 #define PHYS_ADDR 0x60100000
 #define CONTROL_REG 0
@@ -43,6 +55,11 @@ static uint64_t char_pos = 0, char_buf_sz = 0, char_line_start = 0;
 static char *log_buf = nullptr;
 static bool dump_mem = false;
 static uint8_t *c_addr = nullptr;
+
+static const int width = 320;
+static const int height = 200;
+static SDL_Window *sdlwin = nullptr;
+static SDL_Surface *sdlscr = nullptr;
 
 
 struct rvstatus_ {
@@ -163,19 +180,16 @@ void dumplog() {
 
 
 typedef unsigned char Rgb[3];
-struct color {
-    uint32_t b:8;
-    uint32_t g:8;
-    uint32_t r:8;
-    uint32_t a:8;
-};
-
 
 void sigintHandler(int id) {
   report_status();
   dumplog();
+
+  if(sdlwin) {
+    SDL_DestroyWindow(sdlwin);
+  }
+  
   if(dump_mem and (c_addr != nullptr)) {
-    const int width = 320, height = 200;
     Rgb *framebuffer = new Rgb[width * height];
     color *pixels = reinterpret_cast<color*>(c_addr+0x6000000);
     
@@ -253,6 +267,33 @@ static inline bool read_char_fifo(bool &done) {
   return true;
 }
 
+static void drawFrame() {
+  SDL_Event e;
+  color *out = nullptr, *in = nullptr;
+  if(c_addr == nullptr) {
+    return;
+  }
+  
+  SDL_LockSurface(sdlscr);
+  out = reinterpret_cast<color*>(sdlscr->pixels);
+  assert(out != nullptr);
+  //printf("out ptr = %p\n", out);
+  in = reinterpret_cast<color*>(c_addr+0x6000000);
+  
+  for(int i = 0; i < 8192; /*(width*height);*/ i++) {
+    out[i] = in[i];
+  }
+  
+  SDL_UnlockSurface(sdlscr);
+  SDL_UpdateWindowSurface(sdlwin);
+  while(SDL_PollEvent(&e)) {
+    
+    break;
+  }    
+    
+}
+
+
 int main(int argc, char *argv[]) {
   namespace po = boost::program_options; 
   bool initialize = true;
@@ -262,6 +303,8 @@ int main(int argc, char *argv[]) {
   void *vaddr = nullptr;
   std::string chpt_name;
   po::options_description desc("Options");
+  uint64_t total_us = 0;
+  
   desc.add_options() 
     ("help,h", "Print help messages") 
     ("initialize,i", po::value<bool>(&initialize)->default_value(true), "initialize") 
@@ -281,6 +324,20 @@ int main(int argc, char *argv[]) {
   if(chpt_name.size() == 0) {
     return -1;
   }
+
+  SDL_Init(SDL_INIT_VIDEO);
+  sdlwin = SDL_CreateWindow("FB", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+			    width, height,
+			    SDL_WINDOW_SHOWN);
+  assert(sdlwin);
+  sdlscr = SDL_GetWindowSurface(sdlwin);
+  assert(sdlscr);
+  
+  //while(true) {
+  //drawFrame();
+  //usleep(10000);
+  //}
+  
   fd = open("/dev/mem", O_RDWR | O_SYNC);
   assert(fd != -1);
   
@@ -333,7 +390,10 @@ int main(int argc, char *argv[]) {
     linux_started = true;
   }
   
-  uint64_t total_us = 0;
+
+
+
+
   
   while(not(done)) {
     ss++;
@@ -346,6 +406,7 @@ int main(int argc, char *argv[]) {
 	printf("linux kernel not yet started???\n");
 	done = true;
       }
+      drawFrame();
       if(not(new_c)) {
 	usleep(us_amt);
 	us_amt = std::min(us_amt+1, 1000);
