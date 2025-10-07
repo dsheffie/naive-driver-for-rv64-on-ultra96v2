@@ -1,7 +1,7 @@
 OBJ = axi.o helper.o saveState.o
 CXX = g++
 EXE = axi
-OPT = -O0 -g -I/usr/local/include/SDL2 -D_GNU_SOURCE=1 -D_REENTRANT
+OPT = -O3 -I/usr/local/include/SDL2 -D_GNU_SOURCE=1 -D_REENTRANT
 CXXFLAGS = -std=c++11 -g $(OPT)
 DEP = $(OBJ:.o=.d)
 LIBS = -lboost_program_options -L/usr/local/lib -Wl,-rpath,/usr/local/lib -lSDL2 -lpthread

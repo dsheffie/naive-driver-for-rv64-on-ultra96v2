@@ -39,9 +39,19 @@ struct color {
     uint32_t a:8;
 };
 
+union color16 {
+  struct {
+    uint16_t b:5;
+    uint16_t g:6;
+    uint16_t r:5;
+  } rgb;
+  uint16_t p;
+};
 
 
-#define PHYS_ADDR 0x60100000
+
+#define PHYS_ADDR 0x60a00000
+
 #define CONTROL_REG 0
 #define STATUS_REG 1
 #define RAM_REG 2
@@ -179,8 +189,6 @@ void dumplog() {
 }
 
 
-typedef unsigned char Rgb[3];
-
 void sigintHandler(int id) {
   report_status();
   dumplog();
@@ -189,31 +197,7 @@ void sigintHandler(int id) {
     SDL_DestroyWindow(sdlwin);
   }
   
-  if(dump_mem and (c_addr != nullptr)) {
-    Rgb *framebuffer = new Rgb[width * height];
-    color *pixels = reinterpret_cast<color*>(c_addr+0x6000000);
-    
-    for(int h = 0, i=0; h < height; h++) {
-      for(int w = 0; w < width; w++) {
-	framebuffer[i][0] = pixels[h*width + w].r;
-	framebuffer[i][1] = pixels[h*width + w].g;
-	framebuffer[i][2] = pixels[h*width + w].b;
-	i++;
-      }
-    }
-    
-    std::ofstream ofs;
-    ofs.open("./raster2d.ppm");
-    ofs << "P6\n" << width << " " << height << "\n255\n";
-    ofs.write((char*)framebuffer, width * height * 3);
-    ofs.close();
-    
-    delete [] framebuffer;
-    
-    //int fd =  ::open("dump.bin", O_RDWR|O_CREAT|O_TRUNC, 0600);
-    //write(fd, c_addr+0x6000000, 320*200*4);
-    //close(fd);
-  }
+
   exit(-1);
 }
 
@@ -269,20 +253,28 @@ static inline bool read_char_fifo(bool &done) {
 
 static void drawFrame() {
   SDL_Event e;
-  color *out = nullptr, *in = nullptr;
+  uint16_t *out = nullptr;
+  color *in = nullptr;
   if(c_addr == nullptr) {
     return;
   }
-  
+  static_assert(sizeof(color16) == 2, "color16 is wrong size");
   SDL_LockSurface(sdlscr);
-  out = reinterpret_cast<color*>(sdlscr->pixels);
+  out = reinterpret_cast<uint16_t*>(sdlscr->pixels);
   assert(out != nullptr);
   //printf("out ptr = %p\n", out);
   in = reinterpret_cast<color*>(c_addr+0x6000000);
-  
-  for(int i = 0; i < 8192; /*(width*height);*/ i++) {
-    out[i] = in[i];
+
+  for(int i = 0; i < (width*height); i++) {
+    color16 t;
+    t.rgb.r = (in[i].r/8);
+    t.rgb.g = (in[i].g/4);
+    t.rgb.b = (in[i].b/8);
+    out[i] = /*__builtin_bswap16*/(t.p); //.r = in[i].r;
+    //out[i].g = in[i].g;
+    //out[i].b = in[i].b;
   }
+
   
   SDL_UnlockSurface(sdlscr);
   SDL_UpdateWindowSurface(sdlwin);
@@ -291,6 +283,14 @@ static void drawFrame() {
     break;
   }    
     
+}
+
+void *worker(void *arg) {
+  while(true) {
+    drawFrame();
+    usleep(2000);
+  }
+  return nullptr;
 }
 
 
@@ -304,7 +304,7 @@ int main(int argc, char *argv[]) {
   std::string chpt_name;
   po::options_description desc("Options");
   uint64_t total_us = 0;
-  
+  pthread_t thr;
   desc.add_options() 
     ("help,h", "Print help messages") 
     ("initialize,i", po::value<bool>(&initialize)->default_value(true), "initialize") 
@@ -332,6 +332,14 @@ int main(int argc, char *argv[]) {
   assert(sdlwin);
   sdlscr = SDL_GetWindowSurface(sdlwin);
   assert(sdlscr);
+
+  printf("w = %d, h = %d, pitch = %d\n", sdlscr->w, sdlscr->h, sdlscr->pitch);
+  printf("bpp = %d\n", sdlscr->format->BitsPerPixel);
+  printf("format = %s\n", SDL_GetPixelFormatName(sdlscr->format->format));
+  //if( sdlscr->format->BitsPerPixel != 32) {
+  //exit(-1);
+  //}
+  
   
   //while(true) {
   //drawFrame();
@@ -391,7 +399,7 @@ int main(int argc, char *argv[]) {
   }
   
 
-
+  pthread_create(&thr, nullptr, worker, nullptr);
 
 
   
@@ -406,7 +414,6 @@ int main(int argc, char *argv[]) {
 	printf("linux kernel not yet started???\n");
 	done = true;
       }
-      drawFrame();
       if(not(new_c)) {
 	usleep(us_amt);
 	us_amt = std::min(us_amt+1, 1000);
