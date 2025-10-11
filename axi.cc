@@ -32,20 +32,10 @@ static const uint32_t control = 0xA0050000;
 static const uint64_t disk_addr = (384+32)*1024UL*1024UL;
 static const uint64_t memsize = 448*(1UL<<20);
 
-struct color {
-    uint32_t b:8;
-    uint32_t g:8;
-    uint32_t r:8;
-    uint32_t a:8;
-};
-
-union color16 {
-  struct {
-    uint16_t b:5;
-    uint16_t g:6;
-    uint16_t r:5;
-  } rgb;
-  uint16_t p;
+struct color16 {
+  uint16_t b:5;
+  uint16_t g:6;
+  uint16_t r:5;
 };
 
 
@@ -66,8 +56,15 @@ static char *log_buf = nullptr;
 static bool dump_mem = false;
 static uint8_t *c_addr = nullptr;
 
-static const int width = 320;
-static const int height = 200;
+
+static const int fwidth = 320;
+static const int fheight = 200;
+
+static int scale = 1;
+
+static int width = -1;
+static int height = -1;
+
 static SDL_Window *sdlwin = nullptr;
 static SDL_Surface *sdlscr = nullptr;
 
@@ -253,28 +250,36 @@ static inline bool read_char_fifo(bool &done) {
 
 static void drawFrame() {
   SDL_Event e;
-  uint16_t *out = nullptr;
-  color *in = nullptr;
+  color16 *out = nullptr, *in = nullptr;
   if(c_addr == nullptr) {
     return;
   }
   static_assert(sizeof(color16) == 2, "color16 is wrong size");
   SDL_LockSurface(sdlscr);
-  out = reinterpret_cast<uint16_t*>(sdlscr->pixels);
+  out = reinterpret_cast<color16*>(sdlscr->pixels);
   assert(out != nullptr);
   //printf("out ptr = %p\n", out);
-  in = reinterpret_cast<color*>(c_addr+0x6000000);
+  in = reinterpret_cast<color16*>(c_addr+0x6000000);
 
-  for(int i = 0; i < (width*height); i++) {
-    color16 t;
-    t.rgb.r = (in[i].r/8);
-    t.rgb.g = (in[i].g/4);
-    t.rgb.b = (in[i].b/8);
-    out[i] = /*__builtin_bswap16*/(t.p); //.r = in[i].r;
-    //out[i].g = in[i].g;
-    //out[i].b = in[i].b;
+#if 0
+  uint32_t crc = crc32(reinterpret_cast<uint8_t*>(in), sizeof(color16)*fheight*fwidth);
+  std::cout << std::hex << "crc32 = " << crc << std::dec << "\n";
+#endif
+  
+  for(int i = 0; i < fheight; i++) {
+    for(int ii = 0; ii < scale; ii++) {
+      int h = i*scale + ii;
+      for(int j = 0; j < fwidth; j++) {
+	color16 c = in[i*fwidth+j];
+	for(int jj = 0; jj < scale; jj++) {
+	  int w = j*scale + jj;
+	  out[h*width + w] = c;
+	}
+      }
+    }
   }
 
+  //memcpy(out,in,width*height*sizeof(color16));
   
   SDL_UnlockSurface(sdlscr);
   SDL_UpdateWindowSurface(sdlwin);
@@ -311,6 +316,7 @@ int main(int argc, char *argv[]) {
     ("file,f", po::value<std::string>(&chpt_name), "checkpoint filename")
     ("dump,d", po::value<bool>(&dump_mem)->default_value(false), "dump phys mem on exit")
     ("linux", po::value<bool>(&do_linux_check)->default_value(false), "running linux")
+    ("scale", po::value<int>(&scale)->default_value(1), "scaling for fb")
     ;  
   try {
     po::variables_map vm;
@@ -324,7 +330,9 @@ int main(int argc, char *argv[]) {
   if(chpt_name.size() == 0) {
     return -1;
   }
-
+  width = fwidth*scale;
+  height = fheight*scale;
+  
   SDL_Init(SDL_INIT_VIDEO);
   sdlwin = SDL_CreateWindow("FB", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
 			    width, height,
@@ -332,7 +340,8 @@ int main(int argc, char *argv[]) {
   assert(sdlwin);
   sdlscr = SDL_GetWindowSurface(sdlwin);
   assert(sdlscr);
-
+  
+  
   printf("w = %d, h = %d, pitch = %d\n", sdlscr->w, sdlscr->h, sdlscr->pitch);
   printf("bpp = %d\n", sdlscr->format->BitsPerPixel);
   printf("format = %s\n", SDL_GetPixelFormatName(sdlscr->format->format));
