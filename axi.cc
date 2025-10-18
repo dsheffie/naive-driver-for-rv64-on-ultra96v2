@@ -12,6 +12,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/times.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #include <iostream>
@@ -31,6 +32,7 @@
 static const uint32_t control = 0xA0050000;
 static const uint64_t disk_addr = (384+32)*1024UL*1024UL;
 static const uint64_t memsize = 448*(1UL<<20);
+static uint64_t phys_addr = ~0UL;
 
 static uint32_t fb_addr = 0xa000000;
 
@@ -39,10 +41,6 @@ struct color16 {
   uint16_t g:6;
   uint16_t r:5;
 };
-
-
-#define PHYS_ADDR 0x60a00000
-
 
 #define CONTROL_REG 0
 #define STATUS_REG 1
@@ -333,6 +331,17 @@ int main(int argc, char *argv[]) {
   if(chpt_name.size() == 0) {
     return -1;
   }
+  fd = open("/dev/rv64core_fpga", O_RDWR | O_SYNC);
+  assert(fd != -1);  
+  if (ioctl(fd, 0, &phys_addr) < 0) {
+    printf("error with fpga memory ioctl\n");
+    close(fd);
+    exit(-1);
+  }
+  printf("fpga memory starts at %lx\n", phys_addr);
+  close(fd);
+
+  
   width = fwidth*scale;
   height = fheight*scale;
   
@@ -348,15 +357,6 @@ int main(int argc, char *argv[]) {
   printf("w = %d, h = %d, pitch = %d\n", sdlscr->w, sdlscr->h, sdlscr->pitch);
   printf("bpp = %d\n", sdlscr->format->BitsPerPixel);
   printf("format = %s\n", SDL_GetPixelFormatName(sdlscr->format->format));
-  //if( sdlscr->format->BitsPerPixel != 32) {
-  //exit(-1);
-  //}
-  
-  
-  //while(true) {
-  //drawFrame();
-  //usleep(10000);
-  //}
   
   fd = open("/dev/mem", O_RDWR | O_SYNC);
   assert(fd != -1);
@@ -366,7 +366,7 @@ int main(int argc, char *argv[]) {
 	       PROT_READ|PROT_WRITE,
 	       MAP_SHARED,
 	       fd,
-	       PHYS_ADDR);
+	       phys_addr);
   assert(vaddr != MAP_FAILED);
   c_addr = reinterpret_cast<uint8_t*>(vaddr);
   
@@ -380,7 +380,7 @@ int main(int argc, char *argv[]) {
     d->write32(4, 1);
     d->write32(4, 0);
     
-    d->write32(6,PHYS_ADDR);
+    d->write32(6, phys_addr);
     d->write32(8, memsize-1);
     
     d->write32(PC_REG, i_pc);
@@ -446,7 +446,7 @@ int main(int argc, char *argv[]) {
       uint32_t cr_ = cr | STEP_ACK;
       d->write32(4, cr_);
 #if 1
-      uint64_t disp = (d->read32(0x8) - PHYS_ADDR);
+      uint64_t disp = (d->read32(0x8) - phys_addr);
       std::cout
 	<< "state " << state
 	<< " addr " << std::hex << (disp)
