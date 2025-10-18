@@ -32,6 +32,8 @@ static const uint32_t control = 0xA0050000;
 static const uint64_t disk_addr = (384+32)*1024UL*1024UL;
 static const uint64_t memsize = 448*(1UL<<20);
 
+static uint32_t fb_addr = 0xa000000;
+
 struct color16 {
   uint16_t b:5;
   uint16_t g:6;
@@ -39,8 +41,8 @@ struct color16 {
 };
 
 
-
 #define PHYS_ADDR 0x60a00000
+
 
 #define CONTROL_REG 0
 #define STATUS_REG 1
@@ -259,7 +261,7 @@ static void drawFrame() {
   out = reinterpret_cast<color16*>(sdlscr->pixels);
   assert(out != nullptr);
   //printf("out ptr = %p\n", out);
-  in = reinterpret_cast<color16*>(c_addr+0x6000000);
+  in = reinterpret_cast<color16*>(c_addr+fb_addr);
 
 #if 0
   uint32_t crc = crc32(reinterpret_cast<uint8_t*>(in), sizeof(color16)*fheight*fwidth);
@@ -317,6 +319,7 @@ int main(int argc, char *argv[]) {
     ("dump,d", po::value<bool>(&dump_mem)->default_value(false), "dump phys mem on exit")
     ("linux", po::value<bool>(&do_linux_check)->default_value(false), "running linux")
     ("scale", po::value<int>(&scale)->default_value(1), "scaling for fb")
+    ("fbaddr", po::value<uint32_t>(&fb_addr)->default_value(0xa000000), "framebuffer address")
     ;  
   try {
     po::variables_map vm;
