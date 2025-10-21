@@ -42,6 +42,13 @@ struct color16 {
   uint16_t r:5;
 };
 
+struct color24 {
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+} __attribute__((packed));
+
+
 #define CONTROL_REG 0
 #define STATUS_REG 1
 #define RAM_REG 2
@@ -248,9 +255,14 @@ static inline bool read_char_fifo(bool &done) {
   return true;
 }
 
+static color24 palette[256];
 static void drawFrame() {
   SDL_Event e;
-  color16 *out = nullptr, *in = nullptr;
+  color16 *out = nullptr;
+  uint8_t *in = nullptr;
+
+  static_assert(sizeof(color24)==3, "bizarre size on color24");
+  
   if(c_addr == nullptr) {
     return;
   }
@@ -259,21 +271,24 @@ static void drawFrame() {
   out = reinterpret_cast<color16*>(sdlscr->pixels);
   assert(out != nullptr);
   //printf("out ptr = %p\n", out);
-  in = reinterpret_cast<color16*>(c_addr+fb_addr);
+  in = reinterpret_cast<uint8_t*>(c_addr+fb_addr);
+  
+  memcpy(palette, reinterpret_cast<color24*>(&in[fheight*fwidth]), sizeof(color24)*256);
 
-#if 0
-  uint32_t crc = crc32(reinterpret_cast<uint8_t*>(in), sizeof(color16)*fheight*fwidth);
-  std::cout << std::hex << "crc32 = " << crc << std::dec << "\n";
-#endif
+  //uint32_t c = crc32(in, fheight*fwidth);
+  //printf("frame crc %x\n", c);
   
   for(int i = 0; i < fheight; i++) {
     for(int ii = 0; ii < scale; ii++) {
       int h = i*scale + ii;
       for(int j = 0; j < fwidth; j++) {
-	color16 c = in[i*fwidth+j];
+	uint8_t p = in[i*fwidth+j];
+	color24 c = palette[p];
 	for(int jj = 0; jj < scale; jj++) {
 	  int w = j*scale + jj;
-	  out[h*width + w] = c;
+	  out[h*width + w].r = (c.r / 8);
+	  out[h*width + w].g = (c.g / 4);
+	  out[h*width + w].b = (c.b / 8);	  
 	}
       }
     }
@@ -338,7 +353,7 @@ int main(int argc, char *argv[]) {
     close(fd);
     exit(-1);
   }
-  printf("fpga memory starts at %lx\n", phys_addr);
+  printf("fpga memory starts at %lx, fbaddr %x\n", phys_addr, fb_addr);
   close(fd);
 
   
