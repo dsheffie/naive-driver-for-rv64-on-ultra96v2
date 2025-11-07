@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <atomic>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/times.h>
@@ -34,6 +35,8 @@ static const uint64_t disk_addr = (384+32)*1024UL*1024UL;
 static const uint64_t memsize = 448*(1UL<<20);
 static uint64_t phys_addr = ~0UL;
 
+static std::atomic<bool> done;
+
 static uint32_t fb_addr = 0xa000000;
 
 struct color16 {
@@ -41,6 +44,18 @@ struct color16 {
   uint16_t g:6;
   uint16_t r:5;
 };
+
+
+static const int fwidth = 320;
+static const int fheight = 200;
+
+static const int N_FRAMES  = 1024;
+
+static color16 frames[N_FRAMES][fwidth*fheight];
+static uint32_t timestamps[N_FRAMES] = {~0U};
+
+static uint32_t frame_id = 0;
+
 
 #define CONTROL_REG 0
 #define STATUS_REG 1
@@ -57,8 +72,6 @@ static bool dump_mem = false;
 static uint8_t *c_addr = nullptr;
 
 
-static const int fwidth = 320;
-static const int fheight = 200;
 
 static int scale = 1;
 
@@ -187,21 +200,15 @@ void dumplog() {
 
 
 void sigintHandler(int id) {
-  report_status();
-  dumplog();
-
-  if(sdlwin) {
-    SDL_DestroyWindow(sdlwin);
-  }
-  
-
-  exit(-1);
+  done = true;
 }
 
 static const char* linux_version = "Linux version";
-static bool linux_started = false;
+static const char* the_necropolis= "the Necropolis";
+static bool linux_started = false,timedemo_started=false;
 
-static inline bool read_char_fifo(bool &done) {
+
+static inline bool read_char_fifo(std::atomic<bool> &done_) {
   int v = d->read32(0x3a) & 255;
   int wptr =v&0xf, rptr = (v>>4)&0xf;
   if(wptr == rptr) {
@@ -234,11 +241,14 @@ static inline bool read_char_fifo(bool &done) {
     int m = strncmp("fpga_done", l, 9);
     //printf("len = %zu, m = %d, %s \n", len, m, l);
     if(m == 0) {
-      done = true;
+      done_ = true;
     }
     m = strncmp(linux_version, l, sizeof(linux_version)-1);
     if(m == 0) {
       linux_started = true;
+    }
+    if(strncmp(the_necropolis, l, sizeof(the_necropolis)-1) == 0) {
+      timedemo_started = true;
     }
     char_line_start = char_pos;
   }
@@ -254,13 +264,20 @@ static void drawFrame() {
   if(c_addr == nullptr) {
     return;
   }
-  static_assert(sizeof(color16) == 2, "color16 is wrong size");
-  SDL_LockSurface(sdlscr);
-  out = reinterpret_cast<color16*>(sdlscr->pixels);
-  assert(out != nullptr);
   //printf("out ptr = %p\n", out);
   in = reinterpret_cast<color16*>(c_addr+fb_addr);
 
+#if 0 
+  memcpy(frames[frame_id % N_FRAMES], in, sizeof(color16)*fwidth*fheight);
+  timestamps[frame_id % N_FRAMES] = frame_id;
+  frame_id++;
+#endif
+  
+
+  SDL_LockSurface(sdlscr);
+  out = reinterpret_cast<color16*>(sdlscr->pixels);
+  assert(out != nullptr);
+  
 #if 0
   uint32_t crc = crc32(reinterpret_cast<uint8_t*>(in), sizeof(color16)*fheight*fwidth);
   std::cout << std::hex << "crc32 = " << crc << std::dec << "\n";
@@ -291,30 +308,38 @@ static void drawFrame() {
 }
 
 void *worker(void *arg) {
+  
   while(true) {
+    if(done) {
+      break;
+    }
     drawFrame();
     usleep(2000);
   }
+  
   return nullptr;
 }
 
+typedef uint8_t Rgb[3];
 
 int main(int argc, char *argv[]) {
+  static_assert(sizeof(color16) == 2, "color16 is wrong size");  
   namespace po = boost::program_options; 
   bool initialize = true;
   int fd, steps = 0, us_amt = 1;
   uint64_t i_pc = 0, ss = 0, zz = 0;
-  bool done = false, do_linux_check = true;
+  bool do_linux_check = true;
   void *vaddr = nullptr;
   std::string chpt_name;
   po::options_description desc("Options");
   uint64_t total_us = 0;
   pthread_t thr;
+  bool dump_last_frame;
   desc.add_options() 
     ("help,h", "Print help messages") 
     ("initialize,i", po::value<bool>(&initialize)->default_value(true), "initialize") 
     ("file,f", po::value<std::string>(&chpt_name), "checkpoint filename")
-    ("dump,d", po::value<bool>(&dump_mem)->default_value(false), "dump phys mem on exit")
+    ("dump,d", po::value<bool>(&dump_last_frame)->default_value(false), "dump frame on exit")
     ("linux", po::value<bool>(&do_linux_check)->default_value(false), "running linux")
     ("scale", po::value<int>(&scale)->default_value(1), "scaling for fb")
     ("fbaddr", po::value<uint32_t>(&fb_addr)->default_value(0xa000000), "framebuffer address")
@@ -410,7 +435,7 @@ int main(int argc, char *argv[]) {
     linux_started = true;
   }
   
-
+  done = false;
   pthread_create(&thr, nullptr, worker, nullptr);
 
 
@@ -466,25 +491,71 @@ int main(int argc, char *argv[]) {
     //printf("steps = %d\n", steps);
   }
 
-
-  // {
-  //   uint8_t *buf = c_addr+disk_addr;    
-  //   int fd = ::open("disk.img", O_RDWR|O_CREAT|O_TRUNC, 0600);
-  //   write(fd, buf, 16*1024*1024);
-  //   close(fd);
-  // }
+  pthread_join(thr, nullptr);
   
+  if(dump_last_frame) {
+    color16 *in = reinterpret_cast<color16*>(c_addr+fb_addr);
+    Rgb *framebuffer = new Rgb[fwidth * fheight];
+    std::ofstream ofs;
+    ofs.open("last.ppm");
+    ofs << "P6\n" << fwidth << " " << fheight << "\n255\n";
+    for(int j = 0; j < (fwidth*fheight); j++) {
+      color16 pix = in[j];
+      framebuffer[j][0] = 8 * pix.r;
+      framebuffer[j][1] = 4 * pix.g;
+      framebuffer[j][2] = 8 * pix.b;     
+    }
+    ofs.write((char*)framebuffer, fwidth * fheight * 3);
+    ofs.close();
+  }
+  
+  
+  if(frame_id != 0) {
+    uint32_t oldest = timestamps[0], oldest_id = 0;
+    for(uint32_t i = 1; i < N_FRAMES; i++) {
+      if(timestamps[i] < oldest) {
+	oldest = timestamps[i];
+	oldest_id = i;
+      }
+    }
 
-  printf("last pc %x\n", d->read32(7));    
+    printf("found oldest frame at %u\n", oldest_id);
+    Rgb *framebuffer = new Rgb[fwidth * fheight];
+    for(uint32_t i = 0; i < N_FRAMES; i++) {
+   
+      std::ofstream ofs;
+      std::stringstream ss;
+      ss << "frame_" << i << ".ppm";
+      ofs.open(ss.str());
+      ofs << "P6\n" << fwidth << " " << fheight << "\n255\n";
 
-  report_status();
+      for(int j = 0; j < (fwidth*fheight); j++) {
+	color16 pix = frames[oldest_id][j];
+	framebuffer[j][0] = 8 * pix.r;
+	framebuffer[j][1] = 4 * pix.g;
+	framebuffer[j][2] = 8 * pix.b;     
+      }
 
-  std::cout << "axi txns " << d->read32(0x1) << "\n";
-  std::cout << std::hex << "epc : "
-	    << d->read32(0xb) << std::dec << "\n";
+   
+      ofs.write((char*)framebuffer, fwidth * fheight * 3);
+   
+      ofs.close();
+   
+      oldest_id = (oldest_id+1) % N_FRAMES;
+    }
+    delete [] framebuffer;
+  }
+  
+  //printf("last pc %x\n", d->read32(7));    
 
-  std::cout << "last addr " << std::hex << d->read32(0x8) << std::dec << "\n";
-  std::cout << "last data " << std::hex << d->read32(0x9) << std::dec << "\n";
+  //  report_status();
+
+  //std::cout << "axi txns " << d->read32(0x1) << "\n";
+  //std::cout << std::hex << "epc : "
+  //	    << d->read32(0xb) << std::dec << "\n";
+
+  //std::cout << "last addr " << std::hex << d->read32(0x8) << std::dec << "\n";
+  //std::cout << "last data " << std::hex << d->read32(0x9) << std::dec << "\n";
 
 
   
