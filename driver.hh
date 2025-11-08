@@ -60,8 +60,37 @@ class Driver
   uint8_t *get_vaddr() const {
     return reinterpret_cast<uint8_t*>(vaddr);
   }
-  
-
 };
+
+struct rvstatus_ {
+  uint32_t ready : 1;
+  uint32_t flush : 1;
+  uint32_t break_: 1;
+  uint32_t ud : 1;
+  uint32_t bad_addr : 1;
+  uint32_t monitor : 1;
+  uint32_t state : 5;
+  uint32_t l1d_flushed : 1;
+  uint32_t l1i_flushed : 1;
+  uint32_t l2_flushed : 1;
+  uint32_t reset_out : 1;
+  uint32_t mem_req : 1;
+  uint32_t mem_req_opcode : 4;
+  uint32_t l1d_state : 4;
+  uint32_t mem_rsp : 1;
+  uint32_t l1i_state : 3;
+  uint32_t l2_state : 2;
+  uint32_t memq_empty : 1;
+};
+
+static_assert(sizeof(rvstatus_) == 4, "rvstatus bad size");
+
+union rvstatus {
+  uint32_t u;
+  rvstatus_ s;
+  rvstatus(uint32_t u) : u(u) {}
+};
+
+
 
 #endif

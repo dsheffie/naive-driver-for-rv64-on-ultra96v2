@@ -12,6 +12,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/times.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #include <iostream>
@@ -25,11 +26,6 @@
 #include "helper.hh"
 #include "saveState.hh"
 
-static const uint32_t control = 0xA0050000;
-static const uint64_t disk_addr = (384+32)*1024UL*1024UL;
-static const uint64_t memsize = 448*(1UL<<20);
-
-#define PHYS_ADDR 0x60100000
 #define CONTROL_REG 0
 #define STATUS_REG 1
 #define RAM_REG 2
@@ -39,40 +35,17 @@ static const uint64_t memsize = 448*(1UL<<20);
 #define POLL_FREQ ((1UL<<12)-1)
 #define MAX_LOG (1UL<<22)
 
+static const uint32_t control = 0xA0050000;
+static const uint64_t disk_addr = (384+32)*1024UL*1024UL;
+static const uint64_t memsize = 448*(1UL<<20);
+static uint64_t phys_addr = ~0UL;
 static uint64_t char_pos = 0, char_buf_sz = 0, char_line_start = 0;
 static char *log_buf = nullptr;
 static bool dump_mem = false;
 static uint8_t *c_addr = nullptr;
-
-
-struct rvstatus_ {
-  uint32_t ready : 1;
-  uint32_t flush : 1;
-  uint32_t break_: 1;
-  uint32_t ud : 1;
-  uint32_t bad_addr : 1;
-  uint32_t monitor : 1;
-  uint32_t state : 5;
-  uint32_t l1d_flushed : 1;
-  uint32_t l1i_flushed : 1;
-  uint32_t l2_flushed : 1;
-  uint32_t reset_out : 1;
-  uint32_t mem_req : 1;
-  uint32_t mem_req_opcode : 4;
-  uint32_t l1d_state : 4;
-  uint32_t mem_rsp : 1;
-  uint32_t l1i_state : 3;
-  uint32_t l2_state : 2;
-  uint32_t memq_empty : 1;
-};
-
-static_assert(sizeof(rvstatus_) == 4, "rvstatus bad size");
-
-union rvstatus {
-  uint32_t u;
-  rvstatus_ s;
-  rvstatus(uint32_t u) : u(u) {}
-};
+static bool done = false;
+static const char* linux_version = "Linux version";
+static bool linux_started = false;
 
 inline bool cpu_stopped(const rvstatus &rs) {
   return rs.s.break_ or rs.s.ud or rs.s.bad_addr or rs.s.monitor;
@@ -98,15 +71,6 @@ std::ostream &operator<<(std::ostream &out, const rvstatus &rs) {
   out << "mem_rsp         : " << rs.s.mem_rsp << "\n";
   out << "memq_empty      : " << rs.s.memq_empty << "\n";
   return out;
-}
-
-static inline uint8_t *mmap4G() {
-  void* mempt = mmap(nullptr, 1UL<<32, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-  assert(mempt != reinterpret_cast<void*>(-1));
-  assert(madvise(mempt, 1UL<<32, MADV_DONTNEED)==0);
-
-  return reinterpret_cast<uint8_t*>(mempt);
 }
 
 static inline uint64_t read64(Driver *d, int r) {
@@ -163,48 +127,11 @@ void dumplog() {
 
 
 typedef unsigned char Rgb[3];
-struct color {
-    uint32_t b:8;
-    uint32_t g:8;
-    uint32_t r:8;
-    uint32_t a:8;
-};
 
 
 void sigintHandler(int id) {
-  report_status();
-  dumplog();
-  if(dump_mem and (c_addr != nullptr)) {
-    const int width = 320, height = 200;
-    Rgb *framebuffer = new Rgb[width * height];
-    color *pixels = reinterpret_cast<color*>(c_addr+0x6000000);
-    
-    for(int h = 0, i=0; h < height; h++) {
-      for(int w = 0; w < width; w++) {
-	framebuffer[i][0] = pixels[h*width + w].r;
-	framebuffer[i][1] = pixels[h*width + w].g;
-	framebuffer[i][2] = pixels[h*width + w].b;
-	i++;
-      }
-    }
-    
-    std::ofstream ofs;
-    ofs.open("./raster2d.ppm");
-    ofs << "P6\n" << width << " " << height << "\n255\n";
-    ofs.write((char*)framebuffer, width * height * 3);
-    ofs.close();
-    
-    delete [] framebuffer;
-    
-    //int fd =  ::open("dump.bin", O_RDWR|O_CREAT|O_TRUNC, 0600);
-    //write(fd, c_addr+0x6000000, 320*200*4);
-    //close(fd);
-  }
-  exit(-1);
+  done = true;
 }
-
-static const char* linux_version = "Linux version";
-static bool linux_started = false;
 
 static inline bool read_char_fifo(bool &done) {
   int v = d->read32(0x3a) & 255;
@@ -258,7 +185,7 @@ int main(int argc, char *argv[]) {
   bool initialize = true;
   int fd, steps = 0, us_amt = 1;
   uint64_t i_pc = 0, ss = 0, zz = 0;
-  bool done = false, do_linux_check = true;
+  bool do_linux_check = true;
   void *vaddr = nullptr;
   std::string chpt_name;
   po::options_description desc("Options");
@@ -281,6 +208,16 @@ int main(int argc, char *argv[]) {
   if(chpt_name.size() == 0) {
     return -1;
   }
+  fd = open("/dev/rv64core_fpga", O_RDWR | O_SYNC);
+  assert(fd != -1);  
+  if (ioctl(fd, 0, &phys_addr) < 0) {
+    printf("error with fpga memory ioctl\n");
+    close(fd);
+    exit(-1);
+  }
+  printf("fpga memory starts at %lx\n", phys_addr);
+  close(fd);
+  
   fd = open("/dev/mem", O_RDWR | O_SYNC);
   assert(fd != -1);
   
@@ -289,7 +226,7 @@ int main(int argc, char *argv[]) {
 	       PROT_READ|PROT_WRITE,
 	       MAP_SHARED,
 	       fd,
-	       PHYS_ADDR);
+	       phys_addr);
   assert(vaddr != MAP_FAILED);
   c_addr = reinterpret_cast<uint8_t*>(vaddr);
   
@@ -303,7 +240,7 @@ int main(int argc, char *argv[]) {
     d->write32(4, 1);
     d->write32(4, 0);
     
-    d->write32(6,PHYS_ADDR);
+    d->write32(6, phys_addr);
     d->write32(8, memsize-1);
     
     d->write32(PC_REG, i_pc);
@@ -354,61 +291,10 @@ int main(int argc, char *argv[]) {
 	us_amt = 1;
       }
     }
-    
-#if 0
-    if(cr & STEP_MASK) {
-      int state = get_axi_state();
-      if(not(state == 5 || state == 6)) {
-	ss++;
-	continue;
-      }
-      ss = 0;
-      uint32_t cr_ = cr | STEP_ACK;
-      d->write32(4, cr_);
-#if 1
-      uint64_t disp = (d->read32(0x8) - PHYS_ADDR);
-      std::cout
-	<< "state " << state
-	<< " addr " << std::hex << (disp)
-	<< " data " << d->read32(0x9)
-	<< " pc " << d->read32(7)
-	<< std::dec 
-	<< " txns " << d->read32(1)
-	<< " step " << steps
-	<< "\n";
-#endif
-      //cr &= (~STEP_MASK);
-      d->write32(4, cr);
-      steps++;
-    }
-#endif
-    
-    //printf("steps = %d\n", steps);
   }
-
-
-  // {
-  //   uint8_t *buf = c_addr+disk_addr;    
-  //   int fd = ::open("disk.img", O_RDWR|O_CREAT|O_TRUNC, 0600);
-  //   write(fd, buf, 16*1024*1024);
-  //   close(fd);
-  // }
-  
-
-  printf("last pc %x\n", d->read32(7));    
-
-  report_status();
-
-  std::cout << "axi txns " << d->read32(0x1) << "\n";
-  std::cout << std::hex << "epc : "
-	    << d->read32(0xb) << std::dec << "\n";
-
-  std::cout << "last addr " << std::hex << d->read32(0x8) << std::dec << "\n";
-  std::cout << "last data " << std::hex << d->read32(0x9) << std::dec << "\n";
-
-
   
   dumplog();
+  report_status();
   
   munmap(c_addr, memsize);
   return 0;
