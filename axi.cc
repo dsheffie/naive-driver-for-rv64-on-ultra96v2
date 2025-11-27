@@ -38,12 +38,29 @@ static uint64_t phys_addr = ~0UL;
 static std::atomic<bool> done;
 
 static uint32_t fb_addr = 0xa000000;
+static int bpp = -1;
 
 struct color16 {
   uint16_t b:5;
   uint16_t g:6;
   uint16_t r:5;
 };
+
+struct color32 {
+  uint8_t b;
+  uint8_t g;
+  uint8_t r;
+  uint8_t a;  
+};
+
+static inline color32 convert(const color16 &c) {
+  color32 cc;
+  cc.b = c.b * 8;
+  cc.g = c.g * 4;
+  cc.r = c.r * 8;
+  cc.a = 0;
+  return cc;
+}
 
 
 static const int fwidth = 320;
@@ -258,7 +275,7 @@ static inline bool read_char_fifo(std::atomic<bool> &done_) {
   return true;
 }
 
-static void drawFrame() {
+static void drawFrame16bpp() {
   SDL_Event e;
   color16 *out = nullptr, *in = nullptr;
   if(c_addr == nullptr) {
@@ -307,18 +324,71 @@ static void drawFrame() {
     
 }
 
-void *worker(void *arg) {
+static void drawFrame32bpp() {
+  SDL_Event e;
+  color32 *out = nullptr;
+  color16 *in = nullptr;
+  
+  if(c_addr == nullptr) {
+    return;
+  }
+  //printf("out ptr = %p\n", out);
+  in = reinterpret_cast<color16*>(c_addr+fb_addr);
+
+  SDL_LockSurface(sdlscr);
+  out = reinterpret_cast<color32*>(sdlscr->pixels);
+  assert(out != nullptr);
+  
+  
+  for(int i = 0; i < fheight; i++) {
+    for(int ii = 0; ii < scale; ii++) {
+      int h = i*scale + ii;
+      for(int j = 0; j < fwidth; j++) {
+	color16 c = in[i*fwidth+j];
+	for(int jj = 0; jj < scale; jj++) {
+	  int w = j*scale + jj;
+	  out[h*width + w] = convert(c);
+	}
+      }
+    }
+  }
+
+  //memcpy(out,in,width*height*sizeof(color16));
+  
+  SDL_UnlockSurface(sdlscr);
+  SDL_UpdateWindowSurface(sdlwin);
+  while(SDL_PollEvent(&e)) {
+    
+    break;
+  }    
+}    
+
+//32 bit color
+void *worker32(void *arg) {
   
   while(true) {
     if(done) {
       break;
     }
-    drawFrame();
+    drawFrame32bpp();
     usleep(2000);
   }
-  
   return nullptr;
 }
+
+//16 bit color
+void *worker16(void *arg) {
+  
+  while(true) {
+    if(done) {
+      break;
+    }
+    drawFrame16bpp();
+    usleep(2000);
+  }
+  return nullptr;
+}
+
 
 typedef uint8_t Rgb[3];
 
@@ -380,7 +450,9 @@ int main(int argc, char *argv[]) {
   
   
   printf("w = %d, h = %d, pitch = %d\n", sdlscr->w, sdlscr->h, sdlscr->pitch);
-  printf("bpp = %d\n", sdlscr->format->BitsPerPixel);
+  //printf("bpp = %d\n", sdlscr->format->BitsPerPixel);
+  bpp = sdlscr->format->BitsPerPixel;
+  
   printf("format = %s\n", SDL_GetPixelFormatName(sdlscr->format->format));
   
   fd = open("/dev/mem", O_RDWR | O_SYNC);
@@ -436,8 +508,17 @@ int main(int argc, char *argv[]) {
   }
   
   done = false;
-  pthread_create(&thr, nullptr, worker, nullptr);
+  if(bpp == 32) {
+    pthread_create(&thr, nullptr, worker32, nullptr);
+  }
+  else if(bpp == 16) {
+    pthread_create(&thr, nullptr, worker16, nullptr);
+  }
+  else {
+    abort();
+  }
 
+	
 
   
   while(not(done)) {
