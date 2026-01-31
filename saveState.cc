@@ -65,8 +65,9 @@ uint64_t loadState(uint8_t *mem, const std::string &filename) {
   for(uint32_t i = 0; i < h.num_nz_pages; i++) {
     page p;
     sz = read(fd, &p, sizeof(p));
-    //std::cout << "sz = " << sz << "\n";
     assert(sz == sizeof(p));
+    //std::cout << "sz = " << sz << "\n";
+    //std::cout << "p.va = "<< std::hex << p.va <<  std::dec << "\n";
     memcpy(mem+p.va, p.data, 4096);
   }
   close(fd);

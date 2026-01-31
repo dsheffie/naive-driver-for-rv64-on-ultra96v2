@@ -37,10 +37,11 @@
 
 static const uint32_t control = 0xA0050000;
 static const uint64_t disk_addr = (384+32)*1024UL*1024UL;
-static const uint64_t memsize = 448*(1UL<<20);
+static const uint64_t memsize = 496*(1UL<<20);
 static uint64_t phys_addr = ~0UL;
-static uint64_t char_pos = 0, char_buf_sz = 0, char_line_start = 0;
-static char *log_buf = nullptr;
+static uint64_t char_pos = 0, char_line_start = 0;
+static char line_buf[1024];
+
 static bool dump_mem = false;
 static uint8_t *c_addr = nullptr;
 static bool done = false;
@@ -99,6 +100,8 @@ static inline void report_status() {
   uint64_t lat = read64(d, 0x3e);
   uint32_t states = d->read32(0xd);    
   rvstatus rs(d->read32(0xa));
+  uint64_t cycles = read64(d, 0x2a);
+  uint64_t icnt = read64(d, 0x28);  
   std::cout << "core state = " << (states & 31) << "\n";
   std::cout << "l2 state = " << ((states>>5) & 31) << "\n";
   std::cout << "l1i state = " << ((states>>10) & 15) << "\n";
@@ -109,20 +112,24 @@ static inline void report_status() {
   std::cout << "lat = " << lat << "\n";
   std::cout << "avg lat = " << static_cast<double>(lat)/txns << "\n";
   std::cout << "axi busy cycles = " << read64(d, 16) << "\n";
-  std::cout << "cycles = " << read64(d, 0x2a) << "\n";
-  std::cout << "icnt = " << read64(d, 0x28) << "\n";  
-  
+  uint64_t rd_txns = read64(d, 18);
+  uint64_t wr_txns = read64(d, 20);
+  std::cout << "cycles = " << cycles << "\n";
+  std::cout << "icnt = " << icnt << "\n";
+  std::cout << "ipc = " << static_cast<double>(icnt)/cycles << "\n";
+  std::cout << "axi rds = " << rd_txns << "\n";
+  std::cout << "axi wrs = " << wr_txns << "\n";
+  double axi_bytes_per_cycle = static_cast<double>((rd_txns + wr_txns)*16UL) / cycles;
+  std::cout << "axi bw = " << (axi_bytes_per_cycle*1e2) << " mbytes/sec\n";
 }
 
+static FILE *log_fp = nullptr;
 
 void dumplog() {
-  if(log_buf == nullptr) {
+  if(log_fp == nullptr) {
     return;
   }
-  FILE *fp = fopen("output.txt", "w");
-  assert(fp);
-  fwrite(log_buf, 1, char_pos, fp);
-  fclose(fp);
+  fclose(log_fp);
 }
 
 
@@ -139,32 +146,20 @@ static inline bool read_char_fifo(bool &done) {
   if(wptr == rptr) {
     return false;
   }
-  int c = d->read32(0x3b);	
+  int c = d->read32(0x3b);
+  int cc = (c==0 ? '\n' : c);
+  
   printf("%c", c==0 ? '\n' : c);
-
-  if(char_pos == char_buf_sz) {
-    if(char_buf_sz == MAX_LOG) {
-      char_pos = 0;
-    }
-    else {
-      size_t n_sz = std::max(1024UL, 2*char_buf_sz);
-      char *t = new char[n_sz];
-      if(log_buf != nullptr) {
-	memset(t, 0, n_sz);
-	memcpy(t, log_buf, char_buf_sz);
-      }
-      char_buf_sz = n_sz;
-      free(log_buf);
-      log_buf = t;
-    }
+  line_buf[char_pos++] = c==0 ? '\n' : c;
+  if(char_pos == (sizeof(line_buf)/sizeof(line_buf[0]))) {
+    char_pos = 0;
   }
-  //printf("char_pos = %lu, char_buf_sz = %lu\n", char_pos, char_buf_sz);
-  log_buf[char_pos++] = c==0 ? '\n' : c;
+  fwrite(reinterpret_cast<char*>(&cc), 1, 1, log_fp);
+  
   if(c==0 or c == '\n') {
-    char *l = log_buf+char_line_start;
+    char *l = line_buf+char_line_start;
     size_t len = strlen(l);
     int m = strncmp("fpga_done", l, 9);
-    //printf("len = %zu, m = %d, %s \n", len, m, l);
     if(m == 0) {
       done = true;
     }
@@ -232,6 +227,8 @@ int main(int argc, char *argv[]) {
   
   signal(SIGINT, sigintHandler);
   d = new Driver(control);
+
+  log_fp = fopen("output.txt", "w");
   
   if(initialize) {
     memset(vaddr, 0x00, memsize);
