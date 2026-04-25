@@ -35,18 +35,18 @@
 #define POLL_FREQ ((1UL<<12)-1)
 #define MAX_LOG (1UL<<22)
 
+#define MB ((1UL<<20))
+
 static const uint32_t control = 0xA0050000;
 static const uint64_t disk_addr = (384+32)*1024UL*1024UL;
-static const uint64_t memsize = 496*(1UL<<20);
+static const uint64_t memsize = 496*MB;
 static uint64_t phys_addr = ~0UL;
 static uint64_t char_pos = 0, char_line_start = 0;
-static char line_buf[1024];
+static char line_buf[1024] = {0};
 
 static bool dump_mem = false;
 static uint8_t *c_addr = nullptr;
 static bool done = false;
-static const char* linux_version = "Linux version";
-static bool linux_started = false;
 
 inline bool cpu_stopped(const rvstatus &rs) {
   return rs.s.break_ or rs.s.ud or rs.s.bad_addr or rs.s.monitor;
@@ -119,6 +119,14 @@ static inline void report_status() {
   std::cout << "ipc = " << static_cast<double>(icnt)/cycles << "\n";
   std::cout << "axi rds = " << rd_txns << "\n";
   std::cout << "axi wrs = " << wr_txns << "\n";
+  uint64_t e_ld = read64(d, 0x16);
+  uint64_t a_l2 = read64(d, 0x34);
+  uint64_t h_l2 = read64(d, 0x36);
+  std::cout << "early l1d loads   = " << e_ld << "\n";
+  std::cout << "l2 accesses       = " << a_l2 << "\n";
+  std::cout << "frac early = " << (100.0 * (static_cast<double>(e_ld)/a_l2)) << "\n";
+  std::cout << "l2 hits           = " << read64(d, 0x36) << "\n";
+  std::cout << "l2 hit ratio = " << (100.0 * (static_cast<double>(h_l2)/a_l2)) << "\n";
   double axi_bytes_per_cycle = static_cast<double>((rd_txns + wr_txns)*16UL) / cycles;
   std::cout << "axi bw = " << (axi_bytes_per_cycle*1e2) << " mbytes/sec\n";
 }
@@ -140,39 +148,13 @@ void sigintHandler(int id) {
   done = true;
 }
 
-static inline bool read_char_fifo(bool &done) {
-  int v = d->read32(0x3a) & 255;
-  int wptr =v&0xf, rptr = (v>>4)&0xf;
-  if(wptr == rptr) {
-    return false;
-  }
-  int c = d->read32(0x3b);
-  int cc = (c==0 ? '\n' : c);
-  
-  printf("%c", c==0 ? '\n' : c);
-  line_buf[char_pos++] = c==0 ? '\n' : c;
-  if(char_pos == (sizeof(line_buf)/sizeof(line_buf[0]))) {
-    char_pos = 0;
-  }
-  fwrite(reinterpret_cast<char*>(&cc), 1, 1, log_fp);
-  
-  if(c==0 or c == '\n') {
-    char *l = line_buf+char_line_start;
-    size_t len = strlen(l);
-    int m = strncmp("fpga_done", l, 9);
-    if(m == 0) {
-      done = true;
-    }
-    m = strncmp(linux_version, l, sizeof(linux_version)-1);
-    if(m == 0) {
-      linux_started = true;
-    }
-    char_line_start = char_pos;
-  }
-  std::fflush(nullptr);
-  d->write32(0x3a, 1);
-  d->write32(0x3a, 0);
-  return true;
+
+static uint32_t xorshift32(uint32_t &x) {
+  uint32_t t = x;
+  x ^= x << 13;
+  x ^= x >> 17;
+  x ^= x << 5;
+  return t;
 }
 
 int main(int argc, char *argv[]) {
@@ -180,16 +162,15 @@ int main(int argc, char *argv[]) {
   bool initialize = true;
   int fd, steps = 0, us_amt = 1;
   uint64_t i_pc = 0, ss = 0, zz = 0;
-  bool do_linux_check = true;
   void *vaddr = nullptr;
   std::string chpt_name;
   po::options_description desc("Options");
+  rvstatus rs(0);  
   desc.add_options() 
     ("help,h", "Print help messages") 
     ("initialize,i", po::value<bool>(&initialize)->default_value(true), "initialize") 
     ("file,f", po::value<std::string>(&chpt_name), "checkpoint filename")
     ("dump,d", po::value<bool>(&dump_mem)->default_value(false), "dump phys mem on exit")
-    ("linux", po::value<bool>(&do_linux_check)->default_value(false), "running linux")
     ;  
   try {
     po::variables_map vm;
@@ -200,9 +181,7 @@ int main(int argc, char *argv[]) {
     std::cerr << "command-line error : " << e.what() << "\n";
     return -1;
   }
-  if(chpt_name.size() == 0) {
-    return -1;
-  }
+
   fd = open("/dev/rv64core_fpga", O_RDWR | O_SYNC);
   assert(fd != -1);  
   if (ioctl(fd, 0, &phys_addr) < 0) {
@@ -215,6 +194,8 @@ int main(int argc, char *argv[]) {
   
   fd = open("/dev/mem", O_RDWR | O_SYNC);
   assert(fd != -1);
+
+  printf("opened phys memory\n");
   
   vaddr = mmap(0,
 	       memsize,
@@ -224,74 +205,41 @@ int main(int argc, char *argv[]) {
 	       phys_addr);
   assert(vaddr != MAP_FAILED);
   c_addr = reinterpret_cast<uint8_t*>(vaddr);
+
+  printf("mmap'd phys memory\n");
   
-  signal(SIGINT, sigintHandler);
   d = new Driver(control);
 
-  log_fp = fopen("output.txt", "w");
+  printf("open device driver\n");
   
-  if(initialize) {
-    memset(vaddr, 0x00, memsize);
-    i_pc = loadState(c_addr, chpt_name.c_str());
-    d->write32(CONTROL_REG, 0);
-    d->write32(4, 1);
-    d->write32(4, 0);
-    
-    d->write32(6, phys_addr);
-    d->write32(8, memsize-1);
-    
-    d->write32(PC_REG, i_pc);
-    __builtin___clear_cache((char*)vaddr, ((char*)vaddr) + memsize);
-    
-    
-    rvstatus rs(0);
-    while(true) {
-      __sync_synchronize();
-      rs.u = d->read32(0xa);
-      if(rs.s.ready) {
-	break;
-      }
-    }
-  //#define DO_STEP
-    uint32_t cr = 8 | 2;
-    
-    if(getenv("STEP") != nullptr) {
-      cr |= STEP_MASK;
-    }
+  d->write32(6, phys_addr);
+
+  printf("set phys addr\n");
+  d->write32(8, memsize-1);
+
+  printf("set mem size\n");  
+
+  d->write32(CONTROL_REG, 0);
+  d->write32(4, 1);
+  d->write32(4, 0);
+
+  printf("cleared control reg and reset board\n");  
+  
+  while(true) {
     __sync_synchronize();
-    
-    /* let the games begin */
-    d->write32(4, cr);
-  }
-  else {
-    linux_started = true;
-  }
-  
-  uint64_t total_us = 0;
-  
-  while(not(done)) {
-    ss++;
-    zz++;
-    
-    if((zz&POLL_FREQ) == 0) {
-      total_us += us_amt;
-      bool new_c = read_char_fifo(done);
-      if(do_linux_check and (total_us > (1UL<<20)) and not(linux_started)) {
-	printf("linux kernel not yet started???\n");
-	done = true;
-      }
-      if(not(new_c)) {
-	usleep(us_amt);
-	us_amt = std::min(us_amt+1, 1000);
-      }
-      else {
-	us_amt = 1;
-      }
+    rs.u = d->read32(0xa);
+    if(rs.s.ready) {
+      printf("ready!\n");
+      break;
     }
   }
   
-  dumplog();
-  report_status();
+  uint32_t cr = 8 | 2;
+  d->write32(4, cr);
+
+  while(true) {
+    printf("last pc = %x\n", d->read32(7));
+  }
   
   munmap(c_addr, memsize);
   return 0;

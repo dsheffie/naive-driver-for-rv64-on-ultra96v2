@@ -1,6 +1,6 @@
 OBJ = axi.o helper.o saveState.o
 CXX = g++
-EXE = axi
+EXE = mips-axi
 OPT = -O3
 CXXFLAGS = -std=c++11 -g $(OPT)
 DEP = $(OBJ:.o=.d)
