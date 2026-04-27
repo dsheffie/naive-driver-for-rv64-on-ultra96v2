@@ -1,4 +1,4 @@
-OBJ = axi.o helper.o saveState.o
+OBJ = axi.o helper.o saveState.o loadelf.o
 CXX = g++
 EXE = mips-axi
 OPT = -O3

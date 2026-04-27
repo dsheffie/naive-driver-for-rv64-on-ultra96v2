@@ -38,9 +38,11 @@ class Driver
 			    flags,
 			    fd,
 			    paddr & ~(pgsize-1));
+    printf("vaddr = %p\n", vaddr);
     assert((void*)vaddr != MAP_FAILED);
     vaddr = vaddr + (paddr & (pgsize-1));
     ptr32 = reinterpret_cast<volatile uint32_t*>(vaddr);
+    printf("magic key %x\n", *ptr32);
   }
   
   
