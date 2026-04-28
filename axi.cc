@@ -20,11 +20,25 @@
 #include <string>
 #include <map>
 #include <boost/program_options.hpp>
+#include <capstone/capstone.h>
 
 #include "helper.hh"
 #include "driver.hh"
 #include "helper.hh"
 #include "saveState.hh"
+#include "disassemble.hh"
+
+union itype {
+  struct {
+    uint32_t imm : 16;
+    uint32_t rs : 5;
+    uint32_t rt : 5;
+    uint32_t op : 6;
+  } uu;
+  uint32_t u;
+};
+
+
 
 #define CONTROL_REG 0
 #define STATUS_REG 1
@@ -126,7 +140,7 @@ int main(int argc, char *argv[]) {
   namespace po = boost::program_options; 
   bool initialize = true;
   int fd, steps = 0, us_amt = 1;
-  uint64_t i_pc = 0, ss = 0, zz = 0;
+  uint32_t pc = 0x20000, max_fetches = 0;  
   void *vaddr = nullptr;
   std::string chpt_name;
   po::options_description desc("Options");
@@ -135,7 +149,7 @@ int main(int argc, char *argv[]) {
     ("help,h", "Print help messages") 
     ("initialize,i", po::value<bool>(&initialize)->default_value(true), "initialize") 
     ("file,f", po::value<std::string>(&chpt_name), "checkpoint filename")
-
+    ("fetches", po::value<uint32_t>(&max_fetches)->default_value(0), "max fetches")
     ;  
   try {
     po::variables_map vm;
@@ -146,7 +160,7 @@ int main(int argc, char *argv[]) {
     std::cerr << "command-line error : " << e.what() << "\n";
     return -1;
   }
-
+  initCapstone();
   fd = open("/dev/rv64core_fpga", O_RDWR | O_SYNC);
   assert(fd != -1);  
   if (ioctl(fd, 0, &phys_addr) < 0) {
@@ -184,16 +198,44 @@ int main(int argc, char *argv[]) {
   //*reinterpret_cast<uint32_t*>(&c_addr[0x20000]) = 0x08000000;
 
   //printf("code buffer has %zu instructions\n", sizeof(code)/sizeof(code[0]));
-  //uint32_t *cptr = reinterpret_cast<uint32_t*>(&c_addr[0x20000]);
+  //pc = 0x20714;
+  pc = 0x0;    
+   uint32_t *cptr = reinterpret_cast<uint32_t*>(&c_addr[pc]);
+#if 0
+   for(uint32_t r = 1; r < 32; r++) {
+     itype y;
+     y.uu.op = 13;
+     y.uu.rt = 0;
+     y.uu.rs = r;
+     y.uu.imm = r & 0xffff;
+     *cptr = bswap<false>(y.u);
+     cptr++;
+   }
+#endif
+   *cptr = bswap<false>(0x08000000); cptr++;   
+   //*cptr = bswap<false>(0x3c020003); cptr++;
+   //*cptr = bswap<false>(0x8c430000); cptr++;
+   //*cptr = bswap<false>(0x24630001); cptr++;
+   //*cptr = bswap<false>(0xac430000); cptr++;
+   //*cptr = bswap<false>(0x080081c6); cptr++;
+   //*cptr = bswap<false>(0x00000000); cptr++;
 
-  uint32_t pc = loadelf("spin.mips", c_addr);
+
+   
+
+   cptr = reinterpret_cast<uint32_t*>(&c_addr[pc]);
+   for(int i = 0; i < 10; i++) {
+     std::cout << std::hex << pc+4*i << " : " << std::dec;
+     disassemble(std::cout, bswap<false>(*cptr), pc + 4*i); std::cout << "\n";
+     ++cptr;
+   }
+
+   d->write32(2, max_fetches);
+   
+  //pc = loadelf("spin.mips", c_addr);
   //*cptr = (0x08000000);
   
-  //for(size_t i = 0; i < (sizeof(code)/sizeof(code[0])); i++) {
-  //*cptr = bswap<false>(code[i]);
-  //++cptr;
-  //}
-  __builtin___clear_cache((char*)vaddr, ((char*)vaddr) + memsize);
+   __builtin___clear_cache((char*)vaddr, ((char*)vaddr) + memsize);
   
   d->write32(6, phys_addr);
 
@@ -207,25 +249,68 @@ int main(int argc, char *argv[]) {
   d->write32(4, 0);
 
   printf("cleared control reg and reset board\n");  
+  d->write32(PC_REG, pc);
   
   while(true) {
     __sync_synchronize();
     rs.u = d->read32(0xa);
     if(rs.s.ready) {
-      printf("ready!\n");
+      printf("ready!, state %u\n", rs.s.state);
       break;
     }
   }
 
-  d->write32(PC_REG, pc);
+
   
-  uint32_t cr = 8 | 2 | (1U<<16);
+  uint32_t cr = 8 | 2 /*| (1<<16)*/;
   d->write32(4, cr);
 
-  while(true) {
-    printf("last pc = %x\n", d->read32(7));
+  sleep(1);
+  printf("last pc = %x, insn cnt %u\n",
+	 d->read32(7), d->read32(0));
+  
+  //d->write32(CONTROL_REG, cr|1U<<31);
+  //d->write32(CONTROL_REG, cr);  
+  //sleep(1);
+
+
+
+  printf("last pc = %x, insn cnt %u\n",
+	 d->read32(7), d->read32(0));  
+
+  for(int i = 0; i < 32; i++) {
+    d->write32(14, i);
+    printf("reg %s : %x\n", getGPRName(i).c_str(),
+	   d->read32(0xe));
   }
   
+  for(int i = 0; i < 16; i++) {
+    d->write32(12, i);
+    printf("%d: %x, op %u, branch target %x, dest reg %s\n", i,
+	   d->read32(12),
+	   d->read32(0x17),
+	   d->read32(0x19), 
+	   getGPRName(d->read32(0x18)).c_str());
+  }
+
+  rs.u = d->read32(0xa);
+  printf("core state %u\n", rs.s.state);
+
+  printf("axi reads  %d\n", d->read32(18));
+  printf("axi writes %d\n", d->read32(20));  
+
+  printf("%d register writes\n", d->read32(0x16));
+
+  
+   cptr = reinterpret_cast<uint32_t*>(&c_addr[pc]);
+   for(int i = 0; i < 10; i++) {
+     std::cout << std::hex << pc+4*i << " : " << std::dec;
+     disassemble(std::cout, bswap<false>(*cptr), pc + 4*i); std::cout << "\n";
+     ++cptr;
+   }
+
+
   munmap(c_addr, memsize);
+  stopCapstone();
   return 0;
 }

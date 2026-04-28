@@ -1,10 +1,10 @@
-OBJ = axi.o helper.o saveState.o loadelf.o
+OBJ = axi.o helper.o saveState.o loadelf.o disassemble.o
 CXX = g++
 EXE = mips-axi
 OPT = -O3
 CXXFLAGS = -std=c++11 -g $(OPT)
 DEP = $(OBJ:.o=.d)
-LIBS = -lboost_program_options
+LIBS = -lboost_program_options -lcapstone
 .PHONY: all clean
 
 all: $(EXE)
