@@ -99,6 +99,7 @@ uint32_t loadelf(const char* fn, uint8_t *mem) {
   }
 
   uint32_t lAddr = bswap_(eh32->e_entry);
+  uint32_t pc = lAddr;
 
   e_phnum = bswap_(eh32->e_phnum);
   ph32 = (Elf32_Phdr*)(buf + bswap_(eh32->e_phoff));
@@ -115,6 +116,7 @@ uint32_t loadelf(const char* fn, uint8_t *mem) {
     int32_t p_type = bswap_(ph32->p_type);
     uint32_t p_vaddr = bswap_(ph32->p_vaddr);
     if(p_type == SHT_PROGBITS && p_memsz) {
+      //printf("progbits segment starting at %x, size %d\n", p_vaddr, p_memsz);
       if( (p_vaddr + p_memsz) > lAddr)
 	lAddr = (p_vaddr + p_memsz);
       
@@ -129,7 +131,7 @@ uint32_t loadelf(const char* fn, uint8_t *mem) {
    * are instructions */
   for(int32_t i = 0; i < e_shnum; i++, sh32++) {
     int32_t f = bswap_(sh32->sh_flags);
-    if(f & SHF_EXECINSTR) {
+    if(f & SHT_PROGBITS) {
       uint32_t addr = bswap_(sh32->sh_addr);
       int32_t size = bswap_(sh32->sh_size);
       bool pgAligned = ((addr & 4095) == 0);
@@ -146,5 +148,5 @@ uint32_t loadelf(const char* fn, uint8_t *mem) {
   }
 
   munmap(buf, s.st_size);
-  return lAddr;
+  return pc;
 }

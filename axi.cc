@@ -14,6 +14,8 @@
 #include <sys/times.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 
 #include <iostream>
 #include <fstream>
@@ -28,17 +30,7 @@
 #include "saveState.hh"
 #include "disassemble.hh"
 
-union itype {
-  struct {
-    uint32_t imm : 16;
-    uint32_t rs : 5;
-    uint32_t rt : 5;
-    uint32_t op : 6;
-  } uu;
-  uint32_t u;
-};
-
-
+#define POLL_FREQ ((1UL<<12)-1)
 
 #define CONTROL_REG 0
 #define STATUS_REG 1
@@ -72,67 +64,26 @@ inline double timestamp() {
 
 static Driver *d = nullptr;
 
-static inline int get_axi_state() {
-  uint32_t states = d->read32(0xd);
-  return ((states>>18) & 7);
-}
+static inline void report_status() {}
 
-static inline void report_status() {
-  if(d == nullptr) {
-    return;
+static inline bool read_char_fifo() {
+  int v = d->read32(0x3a) & 255;
+  int wptr =v&0xf, rptr = (v>>4)&0xf;
+  if(wptr == rptr) {
+    return false;
   }
-  uint32_t states = d->read32(0xd);    
-  std::cout << "core state = " << (states & 31) << "\n";
-  std::cout << "l2 state = " << ((states>>5) & 31) << "\n";
-  std::cout << "l1i state = " << ((states>>10) & 15) << "\n";
-  std::cout << "l1d state = " << ((states>>14) & 15) << "\n";
-  std::cout << "axi state = " << ((states>>18) & 7) << "\n";
+  int c = d->read32(0x3b);
+  int cc = (c==0 ? '\n' : c);
+  printf("%c", c==0 ? '\n' : c);
+  std::fflush(nullptr);
+  d->write32(0x3a, 1);
+  d->write32(0x3a, 0);
+  return true;
 }
-
-
 
 void sigintHandler(int id) {
   done = true;
 }
-
-
-static const  uint32_t code[] = {
-    0x24090001,
-    0x3c070010, 
-    0x3c080010, 
-    0x01201021, 
-    0x00001821, 
-    0x00022340, 
-    0x00822026, 
-    0x00042c42, 
-    0x00a42026, 
-    0x00673021, 
-    0x00042940, 
-    0x24630004, 
-    0xacc20000, 
-    0x1468fff7, 
-    0x00a41026, 
-    0x08000013, 
-    0x00001821, 
-    0x1068000d, 
-    0x00c44826, 
-    0x00e32821, 
-    0x00092340, 
-    0x00892026, 
-    0x8ca50000, 
-    0x00043442, 
-    0x00c42026, 
-    0x00043140, 
-    0x10a9fff6,
-    0x24630004, 
-    0x24090001, 
-    0x08000003, 
-    0x3c070010, 
-    0x00e83821,
-    0x08000003,
-    0x00404821
-  };
-
 
 uint32_t loadelf(const char* fn, uint8_t *mem);
 
@@ -140,7 +91,7 @@ int main(int argc, char *argv[]) {
   namespace po = boost::program_options; 
   bool initialize = true;
   int fd, steps = 0, us_amt = 1;
-  uint32_t pc = 0x20000, max_fetches = 0;  
+  uint32_t pc = 0x0, max_fetches = 0;  
   void *vaddr = nullptr;
   std::string chpt_name;
   po::options_description desc("Options");
@@ -175,6 +126,7 @@ int main(int argc, char *argv[]) {
   d = new Driver(control);
   printf("complete - open device driver\n");
 
+  assert(d->read32(8) == 0x7370696d);
   
   fd = open("/dev/mem", O_RDWR | O_SYNC);
   assert(fd != -1);
@@ -193,48 +145,35 @@ int main(int argc, char *argv[]) {
   printf("mmap'd phys memory\n");
   memset(vaddr, 0, memsize);
 
-  //0:	08000000 	j	0 <foo>
-  //4:	00000000 	nop
-  //*reinterpret_cast<uint32_t*>(&c_addr[0x20000]) = 0x08000000;
-
-  //printf("code buffer has %zu instructions\n", sizeof(code)/sizeof(code[0]));
-  //pc = 0x20714;
-  pc = 0x0;    
-   uint32_t *cptr = reinterpret_cast<uint32_t*>(&c_addr[pc]);
-#if 0
-   for(uint32_t r = 1; r < 32; r++) {
-     itype y;
-     y.uu.op = 13;
-     y.uu.rt = 0;
-     y.uu.rs = r;
-     y.uu.imm = r & 0xffff;
-     *cptr = bswap<false>(y.u);
-     cptr++;
-   }
-#endif
-   *cptr = bswap<false>(0x08000000); cptr++;   
-   //*cptr = bswap<false>(0x3c020003); cptr++;
-   //*cptr = bswap<false>(0x8c430000); cptr++;
-   //*cptr = bswap<false>(0x24630001); cptr++;
-   //*cptr = bswap<false>(0xac430000); cptr++;
-   //*cptr = bswap<false>(0x080081c6); cptr++;
-   //*cptr = bswap<false>(0x00000000); cptr++;
-
-
-   
-
-   cptr = reinterpret_cast<uint32_t*>(&c_addr[pc]);
-   for(int i = 0; i < 10; i++) {
-     std::cout << std::hex << pc+4*i << " : " << std::dec;
-     disassemble(std::cout, bswap<false>(*cptr), pc + 4*i); std::cout << "\n";
-     ++cptr;
-   }
-
-   d->write32(2, max_fetches);
-   
-  //pc = loadelf("spin.mips", c_addr);
-  //*cptr = (0x08000000);
+  d->write32(2, max_fetches);
   
+  pc = loadelf(chpt_name.c_str(), c_addr);
+  uint32_t *cptr = reinterpret_cast<uint32_t*>(&c_addr[pc]);
+  for(int i = 0; i < 32; i++) {
+    std::cout << std::hex << pc+4*i << " : " << std::dec;
+    disassemble(std::cout, bswap<false>(*cptr), pc + 4*i); std::cout << "\n";
+    ++cptr;
+  }  
+
+#if 0
+#define INSN(XX) {*cptr = bswap<false>(XX); cptr++; }
+  INSN(0x24030061);
+  INSN(0x40023800);
+  INSN(0x00000000);
+  INSN(0x1440fffd);
+  INSN(0x00000000);
+  INSN(0x40833800);
+  INSN(0x24630001);
+  INSN(0x40023800);
+  INSN(0x00000000);
+  INSN(0x1440fff7);
+  INSN(0x00000000);
+  INSN(0x1000fff9);
+  INSN(0x00000000);
+  printf("pc = %x\n", pc);
+  cptr = reinterpret_cast<uint32_t*>(&c_addr[pc]);
+#endif
+   
    __builtin___clear_cache((char*)vaddr, ((char*)vaddr) + memsize);
   
   d->write32(6, phys_addr);
@@ -265,23 +204,66 @@ int main(int argc, char *argv[]) {
   uint32_t cr = 8 | 2 /*| (1<<16)*/;
   d->write32(4, cr);
 
-  sleep(1);
-  printf("last pc = %x, insn cnt %u\n",
-	 d->read32(7), d->read32(0));
-  
-  //d->write32(CONTROL_REG, cr|1U<<31);
-  //d->write32(CONTROL_REG, cr);  
-  //sleep(1);
+  //  while(1) {
 
+  // printf("axi reads  %d\n", d->read32(18));
+  //printf("axi writes %d\n", d->read32(20));
+  uint64_t zz= 0 , total_us = 0;
+  double last_time = timestamp(), now;
+  while(1) {
 
+#if 0
+    printf("last pc = %x, insn cnt %u\n", d->read32(7), d->read32(0));
 
-  printf("last pc = %x, insn cnt %u\n",
-	 d->read32(7), d->read32(0));  
+    for(int i = 0; i < 32; i++) {
+      d->write32(14, i);
+      uint32_t reg = d->read32(0xe);
+      if(reg == 0) continue;
+      printf("reg %s : %x\n", getGPRName(i).c_str(), reg);
+    }
+    
+    for(int i = 0; i < 16; i++) {
+      d->write32(12, i);
+      printf("%d: %x, op %u, branch target %x, dest reg %s\n", i,
+	     d->read32(12),
+	     d->read32(0x17),
+	     d->read32(0x19), 
+	     getGPRName(d->read32(0x18)).c_str());
+    }
+    rs.u = d->read32(0xa);
+    printf("core state %u\n", rs.s.state);
+  #endif    
 
+    if((zz&POLL_FREQ) == 0) {
+      now = timestamp();
+      if((now-last_time) > 1.0) {
+	break;
+      }      
+      total_us += us_amt;
+      bool new_c = read_char_fifo();
+      if(not(new_c)) {
+	usleep(us_amt);
+       	// printf("last pc %x\n", d->read32(0x7));
+	// for(int i = 0; i <31; i++) {
+	//   d->write32(19, i);
+	//   printf("%d : %x\n", i, d->read32(0x1a));
+	// }
+	us_amt = std::min(us_amt+1, 1000);
+      }
+      else {
+	last_time = timestamp();
+	us_amt = 1;
+      }
+    }
+    
+  }
+
+#if 0  
   for(int i = 0; i < 32; i++) {
     d->write32(14, i);
-    printf("reg %s : %x\n", getGPRName(i).c_str(),
-	   d->read32(0xe));
+    uint32_t reg = d->read32(0xe);
+    if(reg == 0) continue;
+    printf("reg %s : %x\n", getGPRName(i).c_str(), reg);
   }
   
   for(int i = 0; i < 16; i++) {
@@ -292,23 +274,25 @@ int main(int argc, char *argv[]) {
 	   d->read32(0x19), 
 	   getGPRName(d->read32(0x18)).c_str());
   }
-
-  rs.u = d->read32(0xa);
-  printf("core state %u\n", rs.s.state);
-
+#endif
+  printf("last pc = %x, insn cnt %u\n", d->read32(7), d->read32(0));
   printf("axi reads  %d\n", d->read32(18));
   printf("axi writes %d\n", d->read32(20));  
 
   printf("%d register writes\n", d->read32(0x16));
+  rs.u = d->read32(0xa);
+  printf("core state %u\n", rs.s.state);
+  printf("l1d state %u\n", rs.s.l1d_state);
+  printf("l1i state %u\n", rs.s.l1i_state);  
+  printf("l2 state %u\n", rs.s.l2_state);  
 
+  uint32_t states = d->read32(0xd);    
+  std::cout << "core state = " << (states & 31) << "\n";
+  std::cout << "l2 state = " << ((states>>5) & 15) << "\n";
+  std::cout << "l1i state = " << ((states>>9) & 7) << "\n";
+  std::cout << "l1d state = " << ((states>>12) & 15) << "\n";
+  std::cout << "axi state = " << ((states>>16) & 15) << "\n";      
   
-   cptr = reinterpret_cast<uint32_t*>(&c_addr[pc]);
-   for(int i = 0; i < 10; i++) {
-     std::cout << std::hex << pc+4*i << " : " << std::dec;
-     disassemble(std::cout, bswap<false>(*cptr), pc + 4*i); std::cout << "\n";
-     ++cptr;
-   }
-
 
   munmap(c_addr, memsize);
   stopCapstone();
