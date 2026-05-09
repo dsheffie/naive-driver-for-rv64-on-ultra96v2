@@ -1,4 +1,4 @@
-OBJ = axi.o helper.o saveState.o loadelf.o disassemble.o driver.o
+OBJ = axi.o helper.o saveState.o loadelf.o disassemble.o driver.o command_parsing.o
 CXX = g++
 EXE = mips-axi
 OPT = -O3

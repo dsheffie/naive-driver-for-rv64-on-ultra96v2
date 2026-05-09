@@ -21,7 +21,6 @@
 #include <fstream>
 #include <string>
 #include <map>
-#include <boost/program_options.hpp>
 #include <capstone/capstone.h>
 
 #include "helper.hh"
@@ -87,30 +86,24 @@ void sigintHandler(int id) {
 
 uint32_t loadelf(const char* fn, uint8_t *mem);
 
+bool cmdline(int argc,
+	     char *argv[],
+	     bool &initialize,
+	     std::string &chpt_name,
+	     uint32_t &max_fetches);
+
 int main(int argc, char *argv[]) {
-  namespace po = boost::program_options; 
   bool initialize = true;
   int fd, steps = 0, us_amt = 1;
   uint32_t pc = 0x0, max_fetches = 0;  
   void *vaddr = nullptr;
   std::string chpt_name;
-  po::options_description desc("Options");
   rvstatus rs(0);  
-  desc.add_options() 
-    ("help,h", "Print help messages") 
-    ("initialize,i", po::value<bool>(&initialize)->default_value(true), "initialize") 
-    ("file,f", po::value<std::string>(&chpt_name), "checkpoint filename")
-    ("fetches", po::value<uint32_t>(&max_fetches)->default_value(0), "max fetches")
-    ;  
-  try {
-    po::variables_map vm;
-    po::store(po::parse_command_line(argc, argv, desc), vm);
-    po::notify(vm); 
-  }
-  catch(po::error &e) {
-    std::cerr << "command-line error : " << e.what() << "\n";
+
+  if(not(cmdline(argc, argv, initialize, chpt_name, max_fetches))) {
     return -1;
   }
+  
   initCapstone();
   fd = open("/dev/rv64core_fpga", O_RDWR | O_SYNC);
   assert(fd != -1);  
