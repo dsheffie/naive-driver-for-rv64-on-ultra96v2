@@ -25,7 +25,6 @@ Driver::Driver(uintptr_t paddr)
     assert((void*)vaddr != MAP_FAILED);
     vaddr = vaddr + (paddr & (pgsize-1));
     ptr32 = reinterpret_cast<volatile uint32_t*>(vaddr);
-    printf("magic key %x\n", *ptr32);
   }
   
   

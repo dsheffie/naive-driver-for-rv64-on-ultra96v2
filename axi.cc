@@ -84,23 +84,26 @@ void sigintHandler(int id) {
   done = true;
 }
 
-uint32_t loadelf(const char* fn, uint8_t *mem);
+uint32_t loadelf(const char* fn, uint8_t *mem, bool sgi_mode);
 
 bool cmdline(int argc,
 	     char *argv[],
 	     bool &initialize,
 	     std::string &chpt_name,
-	     uint32_t &max_fetches);
+	     uint32_t &max_fetches,
+	     uint64_t &max_iters,
+	     bool &sgi_mode);
 
 int main(int argc, char *argv[]) {
-  bool initialize = true;
+  bool initialize = true, sgi_mode = false;
   int fd, steps = 0, us_amt = 1;
-  uint32_t pc = 0x0, max_fetches = 0;  
+  uint32_t pc = 0x0, max_fetches = 0;
+  uint64_t max_iters;
   void *vaddr = nullptr;
   std::string chpt_name;
   rvstatus rs(0);  
 
-  if(not(cmdline(argc, argv, initialize, chpt_name, max_fetches))) {
+  if(not(cmdline(argc, argv, initialize, chpt_name, max_fetches, max_iters, sgi_mode))) {
     return -1;
   }
   
@@ -115,10 +118,9 @@ int main(int argc, char *argv[]) {
   printf("fpga memory starts at %lx\n", phys_addr);
   close(fd);
 
-  printf("start - open device driver\n");
   d = new Driver(control);
-  printf("complete - open device driver\n");
 
+  /* check mips */
   assert(d->read32(8) == 0x7370696d);
   
   fd = open("/dev/mem", O_RDWR | O_SYNC);
@@ -140,33 +142,14 @@ int main(int argc, char *argv[]) {
 
   d->write32(2, max_fetches);
   
-  pc = loadelf(chpt_name.c_str(), c_addr);
+  pc = loadelf(chpt_name.c_str(), c_addr, sgi_mode);
   uint32_t *cptr = reinterpret_cast<uint32_t*>(&c_addr[pc]);
-  for(int i = 0; i < 32; i++) {
-    std::cout << std::hex << pc+4*i << " : " << std::dec;
-    disassemble(std::cout, bswap<false>(*cptr), pc + 4*i); std::cout << "\n";
-    ++cptr;
-  }  
+  //for(int i = 0; i < 32; i++) {
+  //std::cout << std::hex << pc+4*i << " : " << std::dec;
+  //disassemble(std::cout, bswap<false>(*cptr), pc + 4*i); std::cout << "\n";
+  //++cptr;
+  //}  
 
-#if 0
-#define INSN(XX) {*cptr = bswap<false>(XX); cptr++; }
-  INSN(0x24030061);
-  INSN(0x40023800);
-  INSN(0x00000000);
-  INSN(0x1440fffd);
-  INSN(0x00000000);
-  INSN(0x40833800);
-  INSN(0x24630001);
-  INSN(0x40023800);
-  INSN(0x00000000);
-  INSN(0x1440fff7);
-  INSN(0x00000000);
-  INSN(0x1000fff9);
-  INSN(0x00000000);
-  printf("pc = %x\n", pc);
-  cptr = reinterpret_cast<uint32_t*>(&c_addr[pc]);
-#endif
-   
    __builtin___clear_cache((char*)vaddr, ((char*)vaddr) + memsize);
   
   d->write32(6, phys_addr);
@@ -179,8 +162,10 @@ int main(int argc, char *argv[]) {
   d->write32(CONTROL_REG, 0);
   d->write32(4, 1);
   d->write32(4, 0);
-
-  printf("cleared control reg and reset board\n");  
+  if(sgi_mode) {
+    d->write32(0xc,1);
+    pc = 0xbfc00000;
+  }
   d->write32(PC_REG, pc);
   
   while(true) {
@@ -197,96 +182,72 @@ int main(int argc, char *argv[]) {
   uint32_t cr = 8 | 2 /*| (1<<16)*/;
   d->write32(4, cr);
 
-  //  while(1) {
-
-  // printf("axi reads  %d\n", d->read32(18));
-  //printf("axi writes %d\n", d->read32(20));
   uint64_t zz= 0 , total_us = 0;
-  double last_time = timestamp(), now;
-  while(1) {
-
-#if 0
-    printf("last pc = %x, insn cnt %u\n", d->read32(7), d->read32(0));
-
-    for(int i = 0; i < 32; i++) {
-      d->write32(14, i);
-      uint32_t reg = d->read32(0xe);
-      if(reg == 0) continue;
-      printf("reg %s : %x\n", getGPRName(i).c_str(), reg);
-    }
-    
-    for(int i = 0; i < 16; i++) {
-      d->write32(12, i);
-      printf("%d: %x, op %u, branch target %x, dest reg %s\n", i,
-	     d->read32(12),
-	     d->read32(0x17),
-	     d->read32(0x19), 
-	     getGPRName(d->read32(0x18)).c_str());
-    }
-    rs.u = d->read32(0xa);
-    printf("core state %u\n", rs.s.state);
-  #endif    
-
+  uint64_t c = 0;
+  
+  while(c < max_iters) {
     if((zz&POLL_FREQ) == 0) {
-      now = timestamp();
-      if((now-last_time) > 1.0) {
-	break;
-      }      
       total_us += us_amt;
       bool new_c = read_char_fifo();
       if(not(new_c)) {
 	usleep(us_amt);
-       	// printf("last pc %x\n", d->read32(0x7));
-	// for(int i = 0; i <31; i++) {
-	//   d->write32(19, i);
-	//   printf("%d : %x\n", i, d->read32(0x1a));
-	// }
 	us_amt = std::min(us_amt+1, 1000);
+	///printf("last pc = %x, insn cnt %u\n", d->read32(7), d->read32(0));	
       }
       else {
-	last_time = timestamp();
 	us_amt = 1;
       }
     }
-    
+    c++;
   }
 
-#if 0  
-  for(int i = 0; i < 32; i++) {
-    d->write32(14, i);
-    uint32_t reg = d->read32(0xe);
-    if(reg == 0) continue;
-    printf("reg %s : %x\n", getGPRName(i).c_str(), reg);
-  }
-  
-  for(int i = 0; i < 16; i++) {
-    d->write32(12, i);
-    printf("%d: %x, op %u, branch target %x, dest reg %s\n", i,
-	   d->read32(12),
-	   d->read32(0x17),
-	   d->read32(0x19), 
-	   getGPRName(d->read32(0x18)).c_str());
-  }
-#endif
   printf("last pc = %x, insn cnt %u\n", d->read32(7), d->read32(0));
   printf("axi reads  %d\n", d->read32(18));
   printf("axi writes %d\n", d->read32(20));  
 
+  pc = d->read32(7);
+  cptr = reinterpret_cast<uint32_t*>(&c_addr[pc]);
+
+
+
+  printf("cycles since last retired %u\n", d->read32(0x27));
+  uint32_t epc = d->read32(0xb);
   printf("%d register writes\n", d->read32(0x16));
   rs.u = d->read32(0xa);
-  printf("core state %u\n", rs.s.state);
-  printf("l1d state %u\n", rs.s.l1d_state);
-  printf("l1i state %u\n", rs.s.l1i_state);  
-  printf("l2 state %u\n", rs.s.l2_state);  
-
-  uint32_t states = d->read32(0xd);    
-  std::cout << "core state = " << (states & 31) << "\n";
-  std::cout << "l2 state = " << ((states>>5) & 15) << "\n";
-  std::cout << "l1i state = " << ((states>>9) & 7) << "\n";
-  std::cout << "l1d state = " << ((states>>12) & 15) << "\n";
-  std::cout << "axi state = " << ((states>>16) & 15) << "\n";      
+  printf("bad addr %u\n", rs.s.bad_addr);
+  printf("monitor %u\n", rs.s.monitor);
+  printf("ud %u\n", rs.s.ud);
+  printf("break %u\n", rs.s.break_);  
+  printf("epc %x\n", epc);
+  printf("badvaddr %x\n", d->read32(0xc));  
+  printf("cause %u\n", (d->read32(0x26)&31));  
+  printf("last addr %x\n", d->read32(0x9));
   
+  uint32_t states = d->read32(0xd);    
+  std::cout << "core state   = " << (states & 31) << "\n";
+  std::cout << "l2 state     = " << ((states>>5) & 15) << "\n";
+  std::cout << "l1i state    = " << ((states>>9) & 7) << "\n";
+  std::cout << "l1d state    = " << ((states>>12) & 15) << "\n";
+  std::cout << "axi state    = " << ((states>>16) & 15) << "\n";
+  std::cout << "inflight     = " << ((states>>20) & 63) << "\n";
+  std::cout << "l2 rsp state = " << ((states>>26) & 15) << "\n";          
 
+ for(int i = 0; i < 32; i++) {
+    d->write32(14, i);
+    printf("reg %s : %x\n", getGPRName(i).c_str(),
+	   d->read32(0xe));
+ }
+
+ if(1) {
+   uint32_t n = d->read32(0x16);
+   printf("%u instructions retired\n", d->read32(0x16));
+   for(uint32_t i = 0; i <= n; i++) {
+     d->write32(0x16, i);
+     printf("%u : %x\n", i, d->read32(0x17));
+   }
+ }
+	      
+ 
   munmap(c_addr, memsize);
   stopCapstone();
   return 0;

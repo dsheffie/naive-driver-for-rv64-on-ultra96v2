@@ -61,7 +61,29 @@ bool checkLittleEndian(const Elf32_Ehdr *eh32) {
   return (eh32->e_ident[EI_DATA] == ELFDATA2LSB);
 }
 
-uint32_t loadelf(const char* fn, uint8_t *mem) {
+static uint32_t va2pa(uint32_t va) {
+  if((va >> 31) & 1) {
+    return va & 0x1fffffff;
+  }
+  return va;
+}
+
+
+static uint32_t fpga_remap(uint32_t addr) {
+  if(addr <= 0x17ffffff) {
+    addr = addr & 0x0fffffff;
+  }
+  else if((addr >= 0x1f000000) and (addr <= 0x1fffffff)) {
+    addr &= 0x00ffffff;
+    addr += (256*1024*1024);
+  }
+  else {
+    addr = 0xdeadbeef;
+  }
+  return addr;
+}
+
+uint32_t loadelf(const char* fn, uint8_t *mem, bool sgi_mode) {
   struct stat s;
   Elf32_Ehdr *eh32 = nullptr;
   Elf32_Phdr* ph32 = nullptr;
@@ -116,37 +138,20 @@ uint32_t loadelf(const char* fn, uint8_t *mem) {
     int32_t p_type = bswap_(ph32->p_type);
     uint32_t p_vaddr = bswap_(ph32->p_vaddr);
     if(p_type == SHT_PROGBITS && p_memsz) {
-      //printf("progbits segment starting at %x, size %d\n", p_vaddr, p_memsz);
-      if( (p_vaddr + p_memsz) > lAddr)
-	lAddr = (p_vaddr + p_memsz);
+
+      p_vaddr = va2pa(p_vaddr);
+      uint32_t p_paddr = sgi_mode ? fpga_remap(p_vaddr) : p_vaddr;
+      //printf("remap address range %x to %x, sz = %d\n",
+      //p_vaddr, p_paddr, p_memsz);
+      //printf("p_addr mbyte = %u\n", p_paddr >> 20);
       
-      memset(mem+p_vaddr, 0, sizeof(uint8_t)*p_memsz);
-      memcpy(mem+p_vaddr, (uint8_t*)(buf + p_offset),
+      memset(mem+p_paddr, 0, sizeof(uint8_t)*p_memsz);
+      
+      memcpy(mem+p_paddr, (uint8_t*)(buf + p_offset),
 	     sizeof(uint8_t)*p_filesz);
     }
   }
-  /* Iterate through code sections and
-   * mark as no-write. Tag with extra-special
-   * metadata (DBS_PROT_INSN) that these
-   * are instructions */
-  for(int32_t i = 0; i < e_shnum; i++, sh32++) {
-    int32_t f = bswap_(sh32->sh_flags);
-    if(f & SHT_PROGBITS) {
-      uint32_t addr = bswap_(sh32->sh_addr);
-      int32_t size = bswap_(sh32->sh_size);
-      bool pgAligned = ((addr & 4095) == 0);
-      if(pgAligned) {
-	size = (size / pgSize) * pgSize;
-	void *mpaddr = (void*)(mem+addr);
-	rc = mprotect(mpaddr, size, PROT_READ);
-	if(rc != 0) {
-	  printf("mprotect rc = %d, error(%d) = %s\n", rc, 
-		 errno, strerror(errno));
-	}
-      }
-    }
-  }
-
+  //printf("done with elf loader\n");
   munmap(buf, s.st_size);
   return pc;
 }
