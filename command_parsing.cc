@@ -9,7 +9,8 @@ bool cmdline(int argc,
 	     std::string &chpt_name,
 	     uint32_t &max_fetches,
 	     uint64_t &max_iters,
-	     bool &sgi_mode) {
+	     bool &sgi_mode,
+	     bool &single_step) {
   
   namespace po = boost::program_options;
   po::options_description desc("Options");  
@@ -20,6 +21,7 @@ bool cmdline(int argc,
     ("fetches", po::value<uint32_t>(&max_fetches)->default_value(0), "max fetches")
     ("maxiters", po::value<uint64_t>(&max_iters)->default_value(~0UL), "max sample loops")
     ("sgi", po::value<bool>(&sgi_mode)->default_value(false), "sgi memory map")
+    ("step,s", po::value<bool>(&single_step)->default_value(false), "single-step")
     ;  
   try {
     po::variables_map vm;
