@@ -238,6 +238,7 @@ int main(int argc, char *argv[]) {
   uint64_t c = 0;
   volatile uint32_t *halt_flag = (volatile uint32_t*)(c_addr + 0x10D00000ULL); /* sgi: 0xBFD00000 -> c_addr[0x10D00000] */
   *halt_flag = 0;
+  uint32_t magic_flag = 0, core_halt_u = 0; bool core_halted = false;
   
   while(c < max_iters && !done) {
     uint32_t s = cr | 1U<<30;
@@ -247,13 +248,9 @@ int main(int argc, char *argv[]) {
     if((zz&POLL_FREQ) == 0) {
       total_us += us_amt;
       bool new_c = read_char_fifo();
-      if(*halt_flag != 0) { printf("MAGIC HALT: flag=0x%x (poll %lu)\n", *halt_flag, (unsigned long)c); done = true; }
+      if(*halt_flag != 0) { magic_flag = *halt_flag; done = true; }
       rs.u = d->read32(0xa);
-      if(cpu_stopped(rs)) {
-        printf("CORE HALTED: break=%u ud=%u bad_addr=%u monitor=%u (poll %lu)\n",
-               rs.s.break_, rs.s.ud, rs.s.bad_addr, rs.s.monitor, (unsigned long)c);
-        done = true;
-      }
+      if(cpu_stopped(rs)) { core_halt_u = rs.u; core_halted = true; done = true; }
       if(not(new_c)) {
 	usleep(us_amt);
 	us_amt = std::min(us_amt+1, 1000);
@@ -270,8 +267,14 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  while(read_char_fifo()) { }   /* drain remaining console output (full checksum) before exit */
+  /* the magic-halt flag (DRAM) can become visible before the last putchars
+   * reach the console FIFO; settle, then drain to N consecutive empties so
+   * the full checksum is captured (not a truncated prefix). */
+  usleep(5000);
+  for(int e=0; e<200; ) { if(read_char_fifo()) e=0; else { e++; usleep(50); } }
   printf("\n");
+  if(magic_flag) printf("MAGIC HALT: flag=0x%x\n", magic_flag);
+  if(core_halted) { rvstatus hr(core_halt_u); printf("CORE HALTED: break=%u ud=%u bad_addr=%u monitor=%u\n", hr.s.break_, hr.s.ud, hr.s.bad_addr, hr.s.monitor); }
   printf("last pc = %x, insn cnt %u\n", d->read32(7), d->read32(0));
   dump_trace(d);
   printf("axi reads  %d\n", d->read32(18));
