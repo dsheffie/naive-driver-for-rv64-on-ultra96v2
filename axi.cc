@@ -94,7 +94,9 @@ bool cmdline(int argc,
 	     uint32_t &max_fetches,
 	     uint64_t &max_iters,
 	     bool &sgi_mode,
-	     bool &single_step);
+	     bool &single_step,
+	     std::string &arcs_image,
+	     std::string &start_pc);
 
 static void dump_registers(Driver *d) {
   printf("pc=%x cause=%u, sr %x |", d->read32(7), d->read32(0x26)&31, d->read32(0x16));
@@ -128,9 +130,11 @@ int main(int argc, char *argv[]) {
   uint64_t max_iters;
   void *vaddr = nullptr;
   std::string chpt_name;
-  rvstatus rs(0);  
+  std::string arcs_image;
+  std::string start_pc;
+  rvstatus rs(0);
 
-  if(not(cmdline(argc, argv, initialize, chpt_name, max_fetches, max_iters, sgi_mode, single_step))) {
+  if(not(cmdline(argc, argv, initialize, chpt_name, max_fetches, max_iters, sgi_mode, single_step, arcs_image, start_pc))) {
     return -1;
   }
   
@@ -173,7 +177,8 @@ int main(int argc, char *argv[]) {
   printf("starting pc %x\n", pc);
   uint32_t *cptr = reinterpret_cast<uint32_t*>(&c_addr[pc]);
 
-  std::string arcs_image = "arcs_fw.bin";
+  /* arcs_image is set from --arcs (default empty = no firmware loaded;
+   * use arcs_fw.bin for Linux, arcs_irix.bin for IRIX) */
   if(not(arcs_image.empty())) {
     struct stat ast;
     int afd = open(arcs_image.c_str(), O_RDONLY);
@@ -216,6 +221,9 @@ int main(int argc, char *argv[]) {
     d->write32(0xc,1);
     pc = 0xbfc00000;
   }
+  /* --start-pc overrides the ELF entry / sgi default (e.g. arcs_boot 0xa0003000) */
+  if(not(start_pc.empty())) pc = (uint32_t)strtoul(start_pc.c_str(), nullptr, 0);
+  printf("start pc (final) = %x\n", pc);
   d->write32(PC_REG, pc);
   
   while(true) {
@@ -276,7 +284,7 @@ int main(int argc, char *argv[]) {
   if(magic_flag) printf("MAGIC HALT: flag=0x%x\n", magic_flag);
   if(core_halted) { rvstatus hr(core_halt_u); printf("CORE HALTED: break=%u ud=%u bad_addr=%u monitor=%u\n", hr.s.break_, hr.s.ud, hr.s.bad_addr, hr.s.monitor); }
   printf("last pc = %x, insn cnt %u\n", d->read32(7), d->read32(0));
-  dump_trace(d);
+  //dump_trace(d);
   printf("axi reads  %d\n", d->read32(18));
   printf("axi writes %d\n", d->read32(20));  
 
@@ -313,7 +321,7 @@ int main(int argc, char *argv[]) {
 	   d->read32(0xe));
  }
 
- if(1) {
+ if(0) {
    uint32_t n = d->read32(0);
    printf("%u instructions retired\n", d->read32(0));
    for(uint32_t i = 0; i <= n; i++) {
