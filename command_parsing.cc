@@ -6,6 +6,7 @@
 bool cmdline(int argc,
 	     char *argv[],
 	     bool &initialize,
+	     bool &silent,
 	     std::string &chpt_name,
 	     uint32_t &max_fetches,
 	     uint64_t &max_iters,
@@ -18,7 +19,8 @@ bool cmdline(int argc,
   po::options_description desc("Options");  
   desc.add_options() 
     ("help,h", "Print help messages") 
-    ("initialize,i", po::value<bool>(&initialize)->default_value(true), "initialize") 
+    ("initialize,i", po::value<bool>(&initialize)->default_value(true), "initialize")
+    ("silent", po::value<bool>(&silent)->default_value(false), "be quiet")
     ("file,f", po::value<std::string>(&chpt_name), "checkpoint filename")
     ("fetches", po::value<uint32_t>(&max_fetches)->default_value(0), "max fetches")
     ("maxiters", po::value<uint64_t>(&max_iters)->default_value(~0UL), "max sample loops")

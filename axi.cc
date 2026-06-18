@@ -15,6 +15,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/file.h>
 #include <fcntl.h>
 
 #include <iostream>
@@ -90,6 +91,7 @@ uint32_t loadelf(const char* fn, uint8_t *mem, bool sgi_mode);
 bool cmdline(int argc,
 	     char *argv[],
 	     bool &initialize,
+	     bool &silent,
 	     std::string &chpt_name,
 	     uint32_t &max_fetches,
 	     uint64_t &max_iters,
@@ -124,7 +126,7 @@ static void dump_trace(Driver *d) {
 }
 
 int main(int argc, char *argv[]) {
-  bool initialize = true, sgi_mode = false, single_step = false;
+  bool initialize = true, sgi_mode = false, single_step = false, silent = false;
   int fd, steps = 0, us_amt = 1;
   uint32_t pc = 0x0, max_fetches = 0;
   uint64_t max_iters;
@@ -134,10 +136,28 @@ int main(int argc, char *argv[]) {
   std::string start_pc;
   rvstatus rs(0);
 
-  if(not(cmdline(argc, argv, initialize, chpt_name, max_fetches, max_iters, sgi_mode, single_step, arcs_image, start_pc))) {
+  if(not(cmdline(argc, argv, initialize, silent, chpt_name, max_fetches, max_iters, sgi_mode, single_step, arcs_image, start_pc))) {
     return -1;
   }
-  
+
+  /* ---- board access lock ---------------------------------------------------
+   * Only one program may drive the AXI core + the shared-DRAM mmap at a time.
+   * Two concurrent users corrupt each other's control-register sequencing and
+   * wedge the board -- the PS gets CPU-pegged so even ssh stops responding.
+   * Take an exclusive, non-blocking flock and bail out clearly if the board is
+   * already in use.  A wrapper that already holds the lock (boot_irix.sh) sets
+   * MIPS_AXI_LOCK_HELD so we don't self-deadlock against it.  The fd is held for
+   * the process lifetime and the kernel auto-releases it on exit (clean or crash),
+   * so a killed/crashed run never leaves a stale lock. */
+  if(getenv("MIPS_AXI_LOCK_HELD") == nullptr) {
+    int lockfd = open("/tmp/mips-axi.lock", O_CREAT | O_RDWR, 0666);
+    if(lockfd < 0 || flock(lockfd, LOCK_EX | LOCK_NB) != 0) {
+      fprintf(stderr, "mips-axi: BOARD BUSY -- another instance holds the board lock "
+                      "(/tmp/mips-axi.lock); aborting.\n");
+      return -1;
+    }
+  }
+
   initCapstone();
   fd = open("/dev/rv64core_fpga", O_RDWR | O_SYNC);
   assert(fd != -1);  
@@ -191,12 +211,25 @@ int main(int argc, char *argv[]) {
         exit(-1);
     }
     char *abuf = (char*)mmap(nullptr, ast.st_size, PROT_READ, MAP_PRIVATE, afd, 0);
-      /* ARCS SPB lives at kseg1 0xA0001000 -> physical 0x1000 */
-    memcpy(c_addr  + 0x1000, abuf, ast.st_size);
+      /* The ARCS firmware is now an IP22-faithful first-stage boot loader (FSBL)
+       * living in the Boot PROM @ kseg1 0xBFC00000 (phys 0x1fc00000), which the
+       * sgi_mode address map shadows into DRAM @ 0x10C00000.  The FSBL copies the
+       * SPB to 0xA0001000 itself at reset; we just drop the blob in the PROM. */
+    memcpy(c_addr  + 0x10C00000ULL, abuf, ast.st_size);
     munmap(abuf, ast.st_size);
     close(afd);
-    std::cout << "loaded ARCS firmware (" << ast.st_size
-	      << " bytes) at physical 0x1000\n";
+    std::cout << "loaded ARCS FSBL (" << ast.st_size
+	      << " bytes) at phys 0x1fc00000 (dram 0x10C00000)\n";
+    /* Patch the FSBL kernel-entry slot @ phys 0x1fc00008 (-> dram 0x10C00008)
+     * with the loaded kernel's ELF e_entry, big-endian (the MIPS core reads it
+     * with lw).  'pc' still holds loadelf's e_entry here, before the --start-pc
+     * override below.  Without this the FSBL jumps to a baked-in default that
+     * goes stale whenever a kernel rebuild shifts the entry. */
+    c_addr[0x10C00008ULL] = (uint8_t)(pc >> 24);
+    c_addr[0x10C00009ULL] = (uint8_t)(pc >> 16);
+    c_addr[0x10C0000AULL] = (uint8_t)(pc >>  8);
+    c_addr[0x10C0000BULL] = (uint8_t)(pc      );
+    std::cout << "patched FSBL kentry slot @0x1fc00008 (dram 0x10C00008) = 0x" << std::hex << pc << std::dec << "\n";
     
   }
   //for(int i = 0; i < 32; i++) {
@@ -283,53 +316,56 @@ int main(int argc, char *argv[]) {
   printf("\n");
   if(magic_flag) printf("MAGIC HALT: flag=0x%x\n", magic_flag);
   if(core_halted) { rvstatus hr(core_halt_u); printf("CORE HALTED: break=%u ud=%u bad_addr=%u monitor=%u\n", hr.s.break_, hr.s.ud, hr.s.bad_addr, hr.s.monitor); }
-  printf("last pc = %x, insn cnt %u\n", d->read32(7), d->read32(0));
-  //dump_trace(d);
-  printf("axi reads  %d\n", d->read32(18));
-  printf("axi writes %d\n", d->read32(20));  
-
-  pc = d->read32(7);
-  cptr = reinterpret_cast<uint32_t*>(&c_addr[pc]);
 
 
+  if(not(silent)) {
+    printf("last pc = %x, insn cnt %u\n", d->read32(7), d->read32(0));
+    //dump_trace(d);
+    printf("axi reads  %d\n", d->read32(18));
+    printf("axi writes %d\n", d->read32(20));  
 
-  printf("cycles since last retired %u\n", d->read32(0x27));
-  uint32_t epc = d->read32(0xb);
-  printf("%d register writes\n", d->read32(0x16));
-  rs.u = d->read32(0xa);
-  printf("bad addr %u\n", rs.s.bad_addr);
-  printf("monitor %u\n", rs.s.monitor);
-  printf("ud %u\n", rs.s.ud);
-  printf("break %u\n", rs.s.break_);  
-  printf("epc %x\n", epc);
-  printf("badvaddr %x\n", d->read32(0xc));  
-  printf("cause %u\n", (d->read32(0x26)&31));  
-  printf("last addr %x\n", d->read32(0x9));
+    pc = d->read32(7);
+    cptr = reinterpret_cast<uint32_t*>(&c_addr[pc]);
+
+
+
+    printf("cycles since last retired %u\n", d->read32(0x27));
+    uint32_t epc = d->read32(0xb);
+    printf("%d register writes\n", d->read32(0x16));
+    rs.u = d->read32(0xa);
+    printf("bad addr %u\n", rs.s.bad_addr);
+    printf("monitor %u\n", rs.s.monitor);
+    printf("ud %u\n", rs.s.ud);
+    printf("break %u\n", rs.s.break_);  
+    printf("epc %x\n", epc);
+    printf("badvaddr %x\n", d->read32(0xc));  
+    printf("cause %u\n", (d->read32(0x26)&31));  
+    printf("last addr %x\n", d->read32(0x9));
   
-  uint32_t states = d->read32(0xd);    
-  std::cout << "core state   = " << (states & 31) << "\n";
-  std::cout << "l2 state     = " << ((states>>5) & 15) << "\n";
-  std::cout << "l1i state    = " << ((states>>9) & 7) << "\n";
-  std::cout << "l1d state    = " << ((states>>12) & 15) << "\n";
-  std::cout << "axi state    = " << ((states>>16) & 15) << "\n";
-  std::cout << "inflight     = " << ((states>>20) & 63) << "\n";
-  std::cout << "l2 rsp state = " << ((states>>26) & 15) << "\n";          
+    uint32_t states = d->read32(0xd);    
+    std::cout << "core state   = " << (states & 31) << "\n";
+    std::cout << "l2 state     = " << ((states>>5) & 15) << "\n";
+    std::cout << "l1i state    = " << ((states>>9) & 7) << "\n";
+    std::cout << "l1d state    = " << ((states>>12) & 15) << "\n";
+    std::cout << "axi state    = " << ((states>>16) & 15) << "\n";
+    std::cout << "inflight     = " << ((states>>20) & 63) << "\n";
+    std::cout << "l2 rsp state = " << ((states>>26) & 15) << "\n";          
 
- for(int i = 0; i < 32; i++) {
-    d->write32(14, i);
-    printf("reg %s : %x\n", getGPRName(i).c_str(),
-	   d->read32(0xe));
- }
+    for(int i = 0; i < 32; i++) {
+      d->write32(14, i);
+      printf("reg %s : %x\n", getGPRName(i).c_str(),
+	     d->read32(0xe));
+    }
 
- if(0) {
-   uint32_t n = d->read32(0);
-   printf("%u instructions retired\n", d->read32(0));
-   for(uint32_t i = 0; i <= n; i++) {
-     d->write32(0x16, i);
-     printf("%u : %x\n", i, d->read32(0x17));
-   }
- }
-	      
+    if(0) {
+      uint32_t n = d->read32(0);
+      printf("%u instructions retired\n", d->read32(0));
+      for(uint32_t i = 0; i <= n; i++) {
+	d->write32(0x16, i);
+	printf("%u : %x\n", i, d->read32(0x17));
+      }
+    }
+  }
  
   munmap(c_addr, memsize);
   stopCapstone();
