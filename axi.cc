@@ -140,6 +140,11 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
+  /* Ctrl-C / SIGINT -> graceful stop: break the run loop so the post-run
+   * diagnostic dump (last PC, core/L2/L1/AXI states, cycles-since-retire) prints
+   * -- lets us snapshot a wedged/stuck boot instead of killing it blind. */
+  signal(SIGINT, sigintHandler);
+
   /* ---- board access lock ---------------------------------------------------
    * Only one program may drive the AXI core + the shared-DRAM mmap at a time.
    * Two concurrent users corrupt each other's control-register sequencing and
