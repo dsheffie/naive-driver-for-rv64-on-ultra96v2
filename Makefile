@@ -1,4 +1,4 @@
-OBJ = axi.o helper.o saveState.o loadelf.o disassemble.o driver.o command_parsing.o
+OBJ = axi.o helper.o saveState.o loadelf.o disassemble.o driver.o command_parsing.o mon.o
 CXX = g++
 EXE = mips-axi
 OPT = -O3 -g
@@ -7,10 +7,13 @@ DEP = $(OBJ:.o=.d)
 LIBS = -lboost_program_options -lcapstone
 .PHONY: all clean
 
-all: $(EXE)
+all: $(EXE) mipsmon
 
 $(EXE) : $(OBJ)
 	$(CXX) $(CXXFLAGS) $(OBJ) $(LIBS) -o $(EXE)
+
+mipsmon: mipsmon.cc
+	$(CXX) $(CXXFLAGS) mipsmon.cc -o mipsmon
 
 %.o: %.cc
 	$(CXX) -MMD $(CXXFLAGS) -c $< 
@@ -18,4 +21,4 @@ $(EXE) : $(OBJ)
 -include $(DEP)
 
 clean:
-	rm -rf $(EXE) $(OBJ) $(DEP)
+	rm -rf $(EXE) mipsmon $(OBJ) $(DEP)

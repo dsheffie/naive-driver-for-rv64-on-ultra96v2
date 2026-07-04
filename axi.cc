@@ -28,6 +28,7 @@
 
 #include "helper.hh"
 #include "driver.hh"
+#include "mon.hh"
 #include "helper.hh"
 #include "saveState.hh"
 #include "disassemble.hh"
@@ -99,6 +100,7 @@ static inline bool read_char_fifo() {
   int c = d->read32(0x3b);
   int cc = (c==0 ? '\n' : c);
   printf("%c", c==0 ? '\n' : c);
+  mon_console_out(cc);
   std::fflush(nullptr);
   d->write32(0x3a, 1);
   d->write32(0x3a, 0);
@@ -359,6 +361,7 @@ int main(int argc, char *argv[]) {
     d->write32(SCSI_W_SELDELAY, (uint32_t)sd);
     printf("[rtl] SELDELAY set to %d\n", sd); }
   printf("[rtl] revision = %08x (expect 20260629)\n", d->read32(SCSI_R_RTLREV));
+  { const char* mp = getenv("MONPORT"); mon_init(d, mp ? atoi(mp) : 2323); }
 
   /* --- PS<->PL ping-pong producer (experiment): write DATA then SEQ (1MB apart,
    *     different DRAM pages); the MIPS consumer (pingpong.elf) reads-once-after-SEQ
@@ -375,6 +378,7 @@ int main(int argc, char *argv[]) {
 
   FILE* g_trace=nullptr; int g_cdb_count=0; unsigned long g_nlog=0;
   while(c < max_iters && !done) {
+    mon_poll();
 #ifdef CLAUDE_DEBUG
     if(g_trace){
       d->write32(4, cr | (1u<<30));   /* rising edge -> retire ~1 */
