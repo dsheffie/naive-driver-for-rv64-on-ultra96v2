@@ -354,7 +354,7 @@ int main(int argc, char *argv[]) {
   
   /* --- SCSI disk service (PS side) --- */
   scsi_disk g_scsi_disk;
-  g_scsi_disk.open_image("/home/root/irix65-clean.img");   /* root disk; absent => disk-less (no device) */
+  { const char* di = getenv("SCSIDISK"); g_scsi_disk.open_image(di ? di : "/home/root/irix65-clean.img"); }   /* root disk; absent => disk-less (no device) */
   { const char* e = getenv("SELDELAY"); int sd = e ? atoi(e) : 65535;
     d->write32(SCSI_W_SELDELAY, (uint32_t)sd);
     printf("[rtl] SELDELAY set to %d\n", sd); }
