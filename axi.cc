@@ -17,6 +17,8 @@
 #include <sys/mman.h>
 #include <sys/file.h>
 #include <fcntl.h>
+#include <termios.h>
+#include "scsi_arm.h"
 
 #include <iostream>
 #include <fstream>
@@ -47,6 +49,11 @@ static const uint64_t memsize = 496*MB;
 static uint64_t phys_addr = ~0UL;
 
 static uint8_t *c_addr = nullptr;
+
+/* --- XPATH cross-path experiment (MIPS->ARM): the instant we see a console
+ *     char (S00 leg) we read ring[xk] from DDR (M00 leg) and check ==xk. --- */
+static bool     xpath_mode = false, x_started = false;
+static unsigned xk = 0, x_ok = 0, x_bad = 0, x_shown = 0;
 static bool done = false;
 
 inline bool cpu_stopped(const rvstatus &rs) {
@@ -73,6 +80,22 @@ static inline bool read_char_fifo() {
   if(wptr == rptr) {
     return false;
   }
+  if(xpath_mode) {
+    int sc = d->read32(0x3b) & 255;        /* observe the signal (char) on the S00 leg */
+    if(!x_started) {
+      if(sc == 0x02) { x_started = true; xk = 0; }   /* START marker: align to the first dot */
+    } else if(sc == '.') {
+      /* DATA read from DDR (M00 leg), right after observing the signal */
+      volatile uint32_t *ring = (volatile uint32_t*)(c_addr + 0x09000000);
+      uint32_t w = __builtin_bswap32(ring[xk & 0xFFFFu]);   /* MIPS is big-endian */
+      if(w == xk) x_ok++;
+      else { x_bad++; if(x_shown < 12){ printf("XPATH MISMATCH k=%u got=0x%x\n", xk, w); std::fflush(nullptr); x_shown++; } }
+      xk++;
+    }
+    d->write32(0x3a, 1);
+    d->write32(0x3a, 0);
+    return true;
+  }
   int c = d->read32(0x3b);
   int cc = (c==0 ? '\n' : c);
   printf("%c", c==0 ? '\n' : c);
@@ -80,6 +103,49 @@ static inline bool read_char_fifo() {
   d->write32(0x3a, 1);
   d->write32(0x3a, 0);
   return true;
+}
+
+/* SCC serial Rx (ARM/PS -> core): deliver a received byte into the core's Rx
+ * FIFO.  Flow control: reg 0x3a bit8 = Rx-FIFO full (poll before pushing).  The
+ * push request is reg 0x3b bit8 + the byte in [7:0]; S00_AXI edge-detects bit8
+ * into a 1-cycle scc_rx_push pulse (mirrors the putchar pop handshake), so we
+ * raise then clear it. */
+static inline bool scc_rx_full() {
+  return (d->read32(0x3a) >> 8) & 1;
+}
+static inline void scc_rx_push_byte(uint8_t ch) {
+  while(scc_rx_full()) { /* spin: core hasn't drained the Rx FIFO yet */ }
+  d->write32(0x3b, (1u << 8) | ch);  /* push=1 + byte -> edge -> scc_rx_push */
+  d->write32(0x3b, 0);               /* clear push so the next byte re-edges  */
+}
+/* Pump locally-typed stdin bytes into the core's Rx FIFO so you can type at the
+ * guest console.  On a TTY we switch stdin to raw-ish mode -- char-at-a-time, no
+ * local echo (the guest echoes) -- and restore the terminal on exit.  ISIG is
+ * kept ON so Ctrl-C still stops the driver (not sent to the guest).  Reads are
+ * non-blocking so the console-drain poll loop never stalls on a keystroke.
+ * If stdin is not a TTY (piped/redirected) we skip the termios dance and just
+ * pump bytes, so scripted input still works. */
+static struct termios g_saved_tio;
+static bool           g_tio_saved = false;
+static void restore_tty() {
+  if(g_tio_saved) { tcsetattr(0, TCSANOW, &g_saved_tio); g_tio_saved = false; }
+}
+static inline void pump_stdin_to_rx() {
+  static bool init = false;
+  if(!init) {
+    init = true;
+    fcntl(0, F_SETFL, fcntl(0, F_GETFL, 0) | O_NONBLOCK);
+    if(isatty(0) && tcgetattr(0, &g_saved_tio) == 0) {
+      g_tio_saved = true;
+      atexit(restore_tty);
+      struct termios raw = g_saved_tio;
+      raw.c_lflag &= ~(ICANON | ECHO);  /* char-at-a-time, no local echo */
+      raw.c_iflag &= ~(ICRNL);          /* pass CR through unchanged (no CR->NL) */
+      tcsetattr(0, TCSANOW, &raw);
+    }
+  }
+  unsigned char ch;
+  while(read(0, &ch, 1) == 1) scc_rx_push_byte(ch);
 }
 
 void sigintHandler(int id) {
@@ -286,17 +352,132 @@ int main(int argc, char *argv[]) {
   *halt_flag = 0;
   uint32_t magic_flag = 0, core_halt_u = 0; bool core_halted = false;
   
+  /* --- SCSI disk service (PS side) --- */
+  scsi_disk g_scsi_disk;
+  g_scsi_disk.open_image("/home/root/irix65-clean.img");   /* root disk; absent => disk-less (no device) */
+  { const char* e = getenv("SELDELAY"); int sd = e ? atoi(e) : 65535;
+    d->write32(SCSI_W_SELDELAY, (uint32_t)sd);
+    printf("[rtl] SELDELAY set to %d\n", sd); }
+  printf("[rtl] revision = %08x (expect 20260629)\n", d->read32(SCSI_R_RTLREV));
+
+  /* --- PS<->PL ping-pong producer (experiment): write DATA then SEQ (1MB apart,
+   *     different DRAM pages); the MIPS consumer (pingpong.elf) reads-once-after-SEQ
+   *     and checks DATA==SEQ.  c_addr is O_SYNC (uncached). --- */
+  xpath_mode = (getenv("XPATH") != nullptr);
+  const bool pingpong_mode = (getenv("PINGPONG") != nullptr);
+  const bool xpath2_mode   = (getenv("XPATH2") != nullptr);   /* completion direction: ARM produces, signals via SCC Rx */
+  volatile uint32_t *pp_data = (volatile uint32_t*)(c_addr + 0x09000000);
+  volatile uint32_t *pp_seq  = (volatile uint32_t*)(c_addr + 0x09100000);
+  volatile uint32_t *xc_ring = (volatile uint32_t*)(c_addr + 0x09000000);
+  uint32_t pp_n = 0, xc_k = 0;
+  if(pingpong_mode) { *pp_data = 0; *pp_seq = 0; __sync_synchronize(); printf("[pp] ARM producer armed\n"); }
+  if(xpath2_mode)   { printf("[xc] ARM producer armed (completion direction)\n"); }
+
+  FILE* g_trace=nullptr; int g_cdb_count=0; unsigned long g_nlog=0;
   while(c < max_iters && !done) {
+#ifdef CLAUDE_DEBUG
+    if(g_trace){
+      d->write32(4, cr | (1u<<30));   /* rising edge -> retire ~1 */
+      d->write32(4, cr);              /* back to 0, ready for next edge */
+      uint32_t lpc=d->read32(7);
+      fwrite(&lpc,4,1,g_trace);
+      static uint32_t plpc=0; long dd=(long)lpc-(long)plpc; plpc=lpc;
+      if((++g_nlog % 100000)==0){ fprintf(stderr,"[trace] %lu pcs pc=%08x d=%ld\\n",(unsigned long)g_nlog,lpc,dd); fflush(stderr); }
+      if((g_nlog & 0x7f)==0) scsi_arm_poll(d,&g_scsi_disk,c_addr);   /* keep the probe fed */
+      if(lpc>=0x88007790u && lpc<=0x880077c0u){ fprintf(stderr,"[trace] PARK after %lu\\n",(unsigned long)g_nlog); fflush(g_trace); fclose(g_trace); g_trace=nullptr; done=true; }
+      else if(g_nlog>4000000UL){ fprintf(stderr,"[trace] cap 4M\\n"); fflush(g_trace); fclose(g_trace); g_trace=nullptr; done=true; }
+      c++; continue;
+    }
+
+    
+    if(pingpong_mode) {
+      pp_n++;
+      *pp_data = pp_n;          /* DATA first */
+      __sync_synchronize();     /* DSB: data write ordered before the seq write */
+      *pp_seq = pp_n;           /* then SEQ (the signal), a DRAM page away */
+    }
+#endif
+    
+    if(xpath2_mode && !scc_rx_full()) {     /* completion direction: DATA->DDR, then SIGNAL via SCC Rx (S00 leg) */
+      xc_ring[xc_k & 0xFFFFu] = __builtin_bswap32(xc_k);  /* MIPS reads big-endian -> k */
+      __sync_synchronize();                              /* DSB: DATA write before the signal */
+      d->write32(0x3b, (1u << 8) | (xc_k & 0xff));        /* push SCC Rx byte (the signal) */
+      d->write32(0x3b, 0);
+      xc_k++;
+    }
     uint32_t s = cr | 1U<<30;
     if(single_step) {
       d->write32(4, s);
     }
     if((zz&POLL_FREQ) == 0) {
       total_us += us_amt;
+      pump_stdin_to_rx();
+      
+      const bool scsi_serviced = scsi_arm_poll(d, &g_scsi_disk, c_addr);
+      (void)scsi_serviced;   // always service the disk; below is debug-only
+#ifdef CLAUDE_DEBUG
+      if(scsi_serviced){
+        static const bool g_pctrace = getenv("PCTRACE") != nullptr;
+        if(g_pctrace && ++g_cdb_count==1 && !g_trace){
+	  g_trace=fopen("/tmp/pctrace.bin","wb");
+	  g_nlog=0;
+	  cr=(8|2|STEP);
+	  d->write32(4,cr);
+	  fprintf(stderr,"[trace] CDB#1 -> tight single-step to park\n");
+	  fflush(stderr);
+	}
+      }
+
+      {
+	static uint32_t last_dbg = 0xffffffffu;
+	uint32_t dbg = d->read32(SCSI_R_DBG);
+        if(dbg != last_dbg) {
+	  last_dbg = dbg;     /* print-on-change: low spam during the boot */
+          static const bool g_scsidbg = getenv("SCSIDBG") != nullptr;
+          if(g_scsidbg)printf("[scsidbg] 0x38=%08x #rst=%u #rd=%u #scmdwr=%u #sasrwr=%u ph=%u CIP=%u BSY=%u INTRQ=%u SASR=%02x\n",
+				      dbg, (dbg>>28)&0xf, (dbg>>22)&0x3f, (dbg>>16)&0x3f, (dbg>>10)&0x3f,
+				      (dbg>>8)&3, (dbg>>7)&1, (dbg>>6)&1, (dbg>>5)&1, dbg&0x1f); }
+      }
+#endif
       bool new_c = read_char_fifo();
-      if(*halt_flag != 0) { magic_flag = *halt_flag; done = true; }
+      if(*halt_flag != 0) {
+	magic_flag = *halt_flag;
+	done = true;
+      }
       rs.u = d->read32(0xa);
-      if(cpu_stopped(rs)) { core_halt_u = rs.u; core_halted = true; done = true; }
+      if(cpu_stopped(rs)) {
+	core_halt_u = rs.u;
+	core_halted = true;
+	done = true;
+      }
+      /* debug PC-breakpoint (RTL freezes core after retiring BP_PC=0x880023c0):
+       * detect the freeze (last pc stuck at BP_PC, insn cnt stable) and exit so
+       * the post-run dump snapshots the frozen (un-reset) register state. */
+#ifdef CLAUDE_DEBUG
+      {
+	static uint32_t bp_ic=0xffffffffu;
+	static int bp_st=0;
+        uint32_t ic=d->read32(0), lpc=d->read32(7);
+        if(ic==bp_ic){
+	  if(++bp_st>60){
+	    printf("[WP] core FROZEN: last pc=%08x insn=%u\n", lpc, ic);
+	    done=true;
+	  }
+	}
+        else {
+	  bp_st=0;
+	}
+	bp_ic=ic;
+      }
+      {
+	static time_t _lt=0;
+	time_t _nw=time(0);
+	if(_nw!=_lt) {
+	  _lt=_nw;
+	  printf("[stat] insn=%u pc=%08x\n", d->read32(0), d->read32(7)); fflush(stdout);
+	  }
+      }
+#endif
       if(not(new_c)) {
 	usleep(us_amt);
 	us_amt = std::min(us_amt+1, 1000);
@@ -320,12 +501,13 @@ int main(int argc, char *argv[]) {
   for(int e=0; e<200; ) { if(read_char_fifo()) e=0; else { e++; usleep(50); } }
   printf("\n");
   if(magic_flag) printf("MAGIC HALT: flag=0x%x\n", magic_flag);
+  if(xpath_mode) printf("XPATH RESULT ok=%u bad=%u (signals=%u)\n", x_ok, x_bad, xk);
   if(core_halted) { rvstatus hr(core_halt_u); printf("CORE HALTED: break=%u ud=%u bad_addr=%u monitor=%u\n", hr.s.break_, hr.s.ud, hr.s.bad_addr, hr.s.monitor); }
 
 
   if(not(silent)) {
     printf("last pc = %x, insn cnt %u\n", d->read32(7), d->read32(0));
-    //dump_trace(d);
+    dump_trace(d);
     printf("axi reads  %d\n", d->read32(18));
     printf("axi writes %d\n", d->read32(20));  
 
@@ -336,6 +518,7 @@ int main(int argc, char *argv[]) {
 
     printf("cycles since last retired %u\n", d->read32(0x27));
     uint32_t epc = d->read32(0xb);
+    printf("[CP0] EPC=%08x cause=%08x(ExcCode=%u) badvaddr=%08x\n", epc, d->read32(0x26), d->read32(0x26)&31, d->read32(0xc));
     printf("%d register writes\n", d->read32(0x16));
     rs.u = d->read32(0xa);
     printf("bad addr %u\n", rs.s.bad_addr);

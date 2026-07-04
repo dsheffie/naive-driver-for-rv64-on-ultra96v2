@@ -1,7 +1,7 @@
 OBJ = axi.o helper.o saveState.o loadelf.o disassemble.o driver.o command_parsing.o
 CXX = g++
 EXE = mips-axi
-OPT = -O0 -g
+OPT = -O3 -g
 CXXFLAGS = -std=c++11 -g $(OPT)
 DEP = $(OBJ:.o=.d)
 LIBS = -lboost_program_options -lcapstone
