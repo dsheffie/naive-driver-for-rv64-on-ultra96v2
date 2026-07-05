@@ -22,7 +22,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include "scsi_lastcmd.h"
 
+scsi_lastcmd_t g_last_scsi;              /* filled by scsi_arm; dumped by "scsi" */
 static Driver *g_d = nullptr;
 static int g_listen = -1;
 static int g_client = -1;
@@ -88,7 +90,7 @@ void mon_console_out(int c) {
 }
 
 static const char *g_help =
-  "monitor: s(tate) pc epc regs r<N> trace[N] halt go step[N] ret help  c/empty=console\r\n";
+  "monitor: s(tate) pc epc regs r<N> trace[N] halt go step[N] ret scsi help  c/empty=console\r\n";
 
 static void mon_cmd(char *line) {
   Driver *d = g_d;
@@ -103,6 +105,48 @@ static void mon_cmd(char *line) {
   }
   else if(!strncmp(line, "help", 4) || line[0] == '?') {
     mon_send(g_help);
+  }
+  else if(!strncmp(line, "scsi", 4) || !strncmp(line, "dump", 4)) {
+    /* full viz into the last-serviced SCSI command (filled by scsi_arm).
+     * moved<disk (residual!=0) == a multi-segment HPC3 DMA the shim only
+     * partly delivered -- the corruption we chased. */
+    scsi_lastcmd_t &s = g_last_scsi;
+    if(!s.valid) {
+      mon_send("scsi: no command serviced yet\r\n");
+    }
+    else {
+      uint8_t op = s.cdb[0];
+      const char *nm = op==0x00?"TEST_UNIT_READY": op==0x03?"REQ_SENSE":
+                       op==0x08?"READ6": op==0x0a?"WRITE6": op==0x12?"INQUIRY":
+                       op==0x1a?"MODE_SENSE": op==0x25?"READ_CAPACITY":
+                       op==0x28?"READ10": op==0x2a?"WRITE10": "?";
+      uint64_t lba = 0; uint32_t blks = 0;
+      if(op==0x28 || op==0x2a) {
+        lba = ((uint32_t)s.cdb[2]<<24)|((uint32_t)s.cdb[3]<<16)|((uint32_t)s.cdb[4]<<8)|s.cdb[5];
+        blks = ((uint32_t)s.cdb[7]<<8)|s.cdb[8];
+      }
+      else if(op==0x08 || op==0x0a) {
+        lba = (((uint32_t)s.cdb[1]&0x1f)<<16)|((uint32_t)s.cdb[2]<<8)|s.cdb[3];
+        blks = s.cdb[4] ? s.cdb[4] : 256;
+      }
+      snprintf(out, sizeof(out),
+        "scsi cmd #%u seq=%u  %s(0x%02x) dest=%u lun=%u dir=%s\r\n"
+        "  cdb=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x  lba=%llu blks=%u\r\n"
+        "  disk=%u moved=%u residual=%u  %s\r\n"
+        "  status=0x%02x/0x%02x nbdp=0x%08x chain=%u:\r\n",
+        s.n_cmds, s.seq, nm, op, s.dest, s.lun, s.to_device?"WRITE":"READ",
+        s.cdb[0],s.cdb[1],s.cdb[2],s.cdb[3],s.cdb[4],s.cdb[5],s.cdb[6],s.cdb[7],s.cdb[8],s.cdb[9],
+        (unsigned long long)lba, blks,
+        s.bufsz, s.moved, s.residual,
+        s.residual ? "*** SHORTFALL (multi-segment DMA) ***" : "complete",
+        s.scsi_status, s.tgt_status, s.nbdp, s.n_desc);
+      mon_send(out);
+      for(uint32_t i = 0; i < s.n_desc; i++) {
+        snprintf(out, sizeof(out), "    [%u] bp=%08x cnt=%u eox=%u next=%08x\r\n",
+                 i, s.desc[i].bp, s.desc[i].count, s.desc[i].eox, s.desc[i].next);
+        mon_send(out);
+      }
+    }
   }
   else if(!strncmp(line, "state", 5) || (line[0] == 's' && line[1] != 't')) {
     uint32_t st = d->read32(0xd);
