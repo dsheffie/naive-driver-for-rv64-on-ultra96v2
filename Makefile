@@ -2,7 +2,7 @@ OBJ = axi.o helper.o saveState.o loadelf.o disassemble.o driver.o command_parsin
 CXX = g++
 EXE = mips-axi
 OPT = -O3 -g
-CXXFLAGS = -std=c++11 -g $(OPT)
+CXXFLAGS = -std=c++11 -DFAITHFUL_SCSI -g $(OPT)
 DEP = $(OBJ:.o=.d)
 LIBS = -lboost_program_options -lcapstone
 .PHONY: all clean
@@ -13,7 +13,7 @@ $(EXE) : $(OBJ)
 	$(CXX) $(CXXFLAGS) $(OBJ) $(LIBS) -o $(EXE)
 
 mipsmon: mipsmon.cc
-	$(CXX) $(CXXFLAGS) mipsmon.cc -o mipsmon
+	$(CXX) $(CXXFLAGS) mipsmon.cc -o mipsmon -lncurses
 
 %.o: %.cc
 	$(CXX) -MMD $(CXXFLAGS) -c $< 

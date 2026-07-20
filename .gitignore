@@ -1,0 +1,5 @@
+*.o
+*.d
+axi.c
+axi.cc.*
+mips-axi

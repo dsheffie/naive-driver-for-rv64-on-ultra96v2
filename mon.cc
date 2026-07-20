@@ -90,7 +90,7 @@ void mon_console_out(int c) {
 }
 
 static const char *g_help =
-  "monitor: s(tate) pc epc regs r<N> trace[N] halt go step[N] ret scsi help  c/empty=console\r\n";
+  "monitor: s(tate) pc epc regs r<N> trace[N] l2trace[N] head reset halt go step[N] ret perf scsi help  c/empty=console\r\n";
 
 static void mon_cmd(char *line) {
   Driver *d = g_d;
@@ -167,7 +167,18 @@ static void mon_cmd(char *line) {
     mon_send(out);
   }
   else if(!strncmp(line, "ret", 3)) {
-    snprintf(out, sizeof(out), "retired=%u\r\n", d->read32(0x16));
+    uint64_t r = (uint64_t)d->read32(0) | ((uint64_t)d->read32(0x29) << 32);  /* full 64-bit r_insn_cnt */
+    snprintf(out, sizeof(out), "retired=%llu\r\n", (unsigned long long)r);
+    mon_send(out);
+  }
+  else if(!strncmp(line, "perf", 4)) {
+    /* full 64-bit counters: retired = r_insn_cnt (lo 0x28/port0, hi 0x29);
+     * cycles run = r_cycle (lo 0x2a, hi 0x2b).  32-bit reads wrap on long runs. */
+    uint64_t ret = (uint64_t)d->read32(0)    | ((uint64_t)d->read32(0x29) << 32);
+    uint64_t cyc = (uint64_t)d->read32(0x2a) | ((uint64_t)d->read32(0x2b) << 32);
+    unsigned ipc_m = cyc ? (unsigned)(ret * 1000ull / cyc) : 0u;
+    snprintf(out, sizeof(out), "retired=%llu cycles=%llu ipc=%u.%03u\r\n",
+             (unsigned long long)ret, (unsigned long long)cyc, ipc_m / 1000u, ipc_m % 1000u);
     mon_send(out);
   }
   else if(!strncmp(line, "regs", 4) || (line[0] == 'r' && line[1] != 'e')) {
@@ -205,6 +216,47 @@ static void mon_cmd(char *line) {
       snprintf(out, sizeof(out), "%u: %08x\r\n", i, d->read32(0x17));
       mon_send(out);
     }
+  }
+  else if(!strncmp(line, "head", 4)) {
+    /* ROB head dump: 0x1A=head pc, 0x1B=status bits (core.sv dbg_head_status).
+     * [0]rob_empty [1]head_complete [2]can_retire [3]faulted
+     * [4]delay_slot [5]null_delay_slot [6]next_complete [7]dq_empty */
+    unsigned pc = d->read32(0x1a), st = d->read32(0x1b);
+    snprintf(out, sizeof(out),
+      "rob_head pc=%08x status=%02x [%s%s%s%s%s%s%s%s]\r\n", pc, st & 0xff,
+      (st&0x01)?"rob_empty ":"",      (st&0x02)?"head_complete ":"",
+      (st&0x04)?"can_retire ":"",     (st&0x08)?"faulted ":"",
+      (st&0x10)?"delay_slot ":"",     (st&0x20)?"null_delay_slot ":"",
+      (st&0x40)?"next_complete ":"",  (st&0x80)?"dq_empty ":"");
+    mon_send(out);
+  }
+  else if(!strncmp(line, "l2trace", 7)) {
+    /* L2<->AXI event ring (core_l1d_l1i): index bit11 selects it; entry=index[9:2],
+     * word=index[1:0]. regs: 0x23=write index, 0x18=read data, 0x19=read wptr.
+     * word0=cycle, word1={l2st[31:28],req[6],rsp[5],op[4:0]}, word2/3=addr lo/hi. */
+    const char *p = line + 7; while(*p==' ') p++;
+    int want = (*p>='0'&&*p<='9') ? atoi(p) : 40;
+    d->write32(0x17, 0x800);
+    unsigned wptr = d->read32(0x19) & 0xff;
+    for(int i = want; i >= 1; i--) {
+      unsigned e = (wptr - i) & 0xff, w[4];
+      for(int k=0;k<4;k++){ d->write32(0x17, 0x800u | (e<<2) | k); w[k] = d->read32(0x18); }
+      unsigned fl=w[1];
+      snprintf(out,sizeof(out),"%3u: cyc=%u l2st=%u req=%u rsp=%u op=%u addr=%x%08x\r\n",
+               e, w[0], (fl>>28)&0xf, (fl>>6)&1, (fl>>5)&1, fl&0x1f, w[3], w[2]);
+      mon_send(out);
+    }
+  }
+  else if(!strncmp(line, "reset", 5)) {
+    /* Reset the core and leave it HALTED at the reset vector, ready to step out
+     * of reset: halt first (single-step bit) so nothing runs, then pulse the
+     * core-reset bit (bit0) while still halted. */
+    g_cr |= (1u << 31);                     /* halt (single-step) first */
+    d->write32(4, g_cr);
+    d->write32(4, g_cr | 1u);               /* assert core reset (bit0), still halted */
+    d->write32(4, g_cr);                    /* deassert -> parked at reset vector */
+    snprintf(out, sizeof(out), "[reset -- halted at reset vector, pc=%08x; use step]\r\n", d->read32(7));
+    mon_send(out);
   }
   else if(!strncmp(line, "halt", 4) || line[0] == 'h') {
     g_cr |= (1u << 31);                     /* single-step mode = freeze */

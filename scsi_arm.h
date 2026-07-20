@@ -33,6 +33,8 @@
 #include <cstdint>
 #include <vector>
 #include <cstdio>          // CDB logging (IRIX root-mount debug)
+#include <unistd.h>        // usleep (chain-coherence re-read diag)
+#include <map>             // write->read round-trip map (SCSIHASH diag)
 
 enum {
   SCSI_R_SEQ      = 0x30, SCSI_R_CDB0 = 0x31, SCSI_R_CDB1 = 0x32, SCSI_R_CDB2 = 0x33,
@@ -108,11 +110,86 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
   req.xfer_len = 0;
 
   scsi_rsp_t rsp;
+  rsp.seq = seq; rsp.completion = SCSI_DONE_COMPLETE;
+  uint32_t moved = 0;
+#ifdef FAITHFUL_SCSI
+  /* Faithful chunked DMA (Stage A): carry the transfer across HPC3 descriptor-chain
+   * EOX chunk boundaries.  IRIX programs the WD33C93 count for < the CDB length and
+   * pause/resumes >252KB transfers; {buf,pos,total} persist between doorbells, and a
+   * doorbell arriving mid-transfer is a RESUME (same buf, new chain from req.nbdp).
+   * Mirrors interp_mips select_and_transfer()/pause_transfer(). */
+  static std::vector<uint8_t> g_buf;
+  static size_t   g_pos = 0, g_total = 0;
+  static bool     g_active = false, g_to_dev = false;
+  static uint64_t g_wr_lba = 0;
+  static const bool g_scsihash = getenv("SCSIHASH") != nullptr;
+  static uint64_t g_hash = 0, g_hlba = 0; static uint32_t g_hnblk = 0;  /* per-READ payload hash */
+  if(!(g_active && g_pos < g_total)) {          /* NEW command (not a resume) */
+    scsi_service_run(&req, &rsp, disk, g_buf, g_to_dev, g_wr_lba);
+    g_total = g_buf.size(); g_pos = 0;
+    g_active = (rsp.scsi_status == ST_SELECT_TRANSFER_SUCCESS) && !g_buf.empty();
+    g_hash = 1469598103934665603ULL;            /* FNV-1a, matches interp's per-READ hash */
+    g_hlba = ((uint64_t)req.cdb[2]<<24)|((uint64_t)req.cdb[3]<<16)|((uint64_t)req.cdb[4]<<8)|req.cdb[5];
+    g_hnblk = ((uint32_t)req.cdb[7]<<8)|req.cdb[8];
+  } else {                                       /* RESUME the paused transfer */
+    rsp.scsi_status = ST_SELECT_TRANSFER_SUCCESS; rsp.tgt_status = TGT_GOOD;
+  }
+  if(g_active) {
+    moved = scsi_move(scsi_arm_mem, dram, req.nbdp,
+                      g_buf.data() + g_pos, (uint32_t)(g_total - g_pos), g_to_dev);
+    if(g_to_dev) {                               /* WRITE: commit the chunk just read */
+      size_t nb = moved / 512, base = g_pos / 512;
+      for(size_t b = 0; b < nb; b++)
+        disk->block_write(g_wr_lba + base + b, g_buf.data() + g_pos + b * 512);
+    }
+    if(g_scsihash) {                             /* accumulate FNV-1a payload hash, both directions */
+      if(g_to_dev) {                             /* WRITE: hash the bytes the CORE emitted (from g_buf) */
+        for(uint32_t i = 0; i < moved; i++) { g_hash ^= g_buf[g_pos+i]; g_hash *= 1099511628211ULL; }
+      } else {                                   /* READ: hash the DRAM the core will read back */
+        uint32_t nb = req.nbdp, done = 0;
+        for(int gd = 0; gd < 128 && nb && done < moved; gd++) {
+          uint8_t *dd = scsi_arm_mem(dram, nb, 12); if(!dd) break;
+          uint32_t bp = hdma_be32(dd+0), bc = hdma_be32(dd+4);
+          uint32_t cnt = bc & HPC3_BC_COUNT; if(cnt > moved - done) cnt = moved - done;
+          uint8_t *b = cnt ? scsi_arm_mem(dram, bp, cnt) : nullptr;
+          if(b) for(uint32_t i = 0; i < cnt; i++) { g_hash ^= b[i]; g_hash *= 1099511628211ULL; }
+          done += cnt; if(bc & HPC3_BC_EOX) break; nb = hdma_be32(dd+8);
+        }
+      }
+    }
+    g_pos += moved;
+    if(g_pos < g_total) {                         /* chain EOX'd early -> CHUNK PAUSE */
+      rsp.completion  = SCSI_DONE_PAUSE;
+      rsp.scsi_status = g_to_dev ? 0x48 : 0x49;   /* -> shim: INTRQ + phase 0x46      */
+      rsp.residual    = 0;
+    } else {                                      /* whole SCSI command delivered     */
+      rsp.residual = 0; g_active = false;
+      if(g_scsihash) {
+        static std::map<uint64_t,uint64_t> g_wmap;   /* (lba<<16|nblk) -> WRITE hash, for round-trip */
+        uint64_t key = (g_hlba << 16) | (uint64_t)g_hnblk;
+        if(g_to_dev) {                            /* WRITE complete: emit hash + remember for round-trip */
+          fprintf(stderr, "[scsiwhash] op=2a lba=%llu nblk=%u bytes=%zu hash=%016llx\n",
+                  (unsigned long long)g_hlba, g_hnblk, (size_t)g_total, (unsigned long long)g_hash);
+          g_wmap[key] = g_hash;
+        } else {                                  /* READ complete: emit hash + round-trip vs prior WRITE */
+          fprintf(stderr, "[scsihash] op=28 lba=%llu nblk=%u bytes=%zu hash=%016llx\n",
+                  (unsigned long long)g_hlba, g_hnblk, (size_t)g_total, (unsigned long long)g_hash);
+          auto it = g_wmap.find(key);
+          if(it != g_wmap.end())
+            fprintf(stderr, "[rttrip] lba=%llu nblk=%u %s (w=%016llx r=%016llx)\n",
+                    (unsigned long long)g_hlba, g_hnblk,
+                    it->second == g_hash ? "MATCH" : "**MISMATCH**",
+                    (unsigned long long)it->second, (unsigned long long)g_hash);
+        }
+      }
+    }
+  }
+  std::vector<uint8_t> &buf = g_buf;              /* aliases for g_last_scsi snapshot */
+  bool to_dev = g_to_dev; uint64_t wr_lba = g_wr_lba;
+#else
   std::vector<uint8_t> buf;
   bool to_dev = false; uint64_t wr_lba = 0;
   scsi_service_run(&req, &rsp, disk, buf, to_dev, wr_lba);
-
-  uint32_t moved = 0;
   if(rsp.scsi_status == ST_SELECT_TRANSFER_SUCCESS && !buf.empty()) {
     moved = scsi_move(scsi_arm_mem, dram, req.nbdp,
                       buf.data(), (uint32_t)buf.size(), to_dev);
@@ -123,6 +200,7 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
     }
     rsp.residual = (uint32_t)buf.size() - moved;
   }
+#endif
 
   /* IRIX root-mount debug: log every serviced SCSI command + its outcome. */
   static const bool g_scsidbg = getenv("SCSIDBG") != nullptr;
@@ -164,6 +242,34 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
     g_last_scsi.n_desc = nd;
   }
   g_last_scsi.valid = 1;
+
+  /* --- CHAIN DIAG: dump the descriptor chain the ARM walked for this READ, then
+   * re-walk it after a barrier + short delay.  If the two totals differ, the ARM's
+   * first walk saw a STALE chain (IRIX's descriptor write-back hadn't landed) -- a
+   * descriptor-coherence bug that truncates the transfer with a spurious early EOX. */
+  if(g_scsidbg && !to_dev) {
+    uint32_t nb = req.nbdp, tot1 = 0; int nd = 0;
+    fprintf(stderr, "[chain] seq=%u nbdp=0x%08x moved=%u total=%zu:",
+            req.seq, req.nbdp, moved, (size_t)g_total);
+    for(; nd < 64 && nb; nd++) {
+      uint8_t *dd = scsi_arm_mem(dram, nb, 12); if(!dd) break;
+      uint32_t bp = hdma_be32(dd+0), bc = hdma_be32(dd+4);
+      uint32_t cnt = bc & HPC3_BC_COUNT; bool eox = (bc & HPC3_BC_EOX) != 0;
+      if(nd < 6) fprintf(stderr, " [%d bp=%08x cnt=%u%s]", nd, bp, cnt, eox?" EOX":"");
+      tot1 += cnt; if(eox) { nd++; break; } nb = hdma_be32(dd+8);
+    }
+    __sync_synchronize(); usleep(200);          /* let any in-flight writeback land */
+    uint32_t nb2 = req.nbdp, tot2 = 0; int nd2 = 0;
+    for(; nd2 < 64 && nb2; nd2++) {
+      uint8_t *dd = scsi_arm_mem(dram, nb2, 12); if(!dd) break;
+      uint32_t bc = hdma_be32(dd+4); tot2 += (bc & HPC3_BC_COUNT);
+      if(bc & HPC3_BC_EOX) { nd2++; break; } nb2 = hdma_be32(dd+8);
+    }
+    fprintf(stderr, "  ndesc=%d chain_bytes=%u | reread ndesc=%d bytes=%u %s\n",
+            nd, tot1, nd2, tot2,
+            (tot1 != tot2) ? "<<< STALE CHAIN (coherence) >>>" : "(consistent)");
+    fflush(stderr);
+  }
 
   __sync_synchronize();                         /* DRAM writes visible before completion */
   d->write32(SCSI_W_RESID,   rsp.residual);

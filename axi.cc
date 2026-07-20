@@ -50,6 +50,12 @@ static const uint64_t memsize = 496*MB;
 static uint64_t phys_addr = ~0UL;
 
 static uint8_t *c_addr = nullptr;
+static uint32_t rdbe(uint32_t pa){ return ((uint32_t)c_addr[pa]<<24)|((uint32_t)c_addr[pa+1]<<16)|((uint32_t)c_addr[pa+2]<<8)|(uint32_t)c_addr[pa+3]; }
+static volatile sig_atomic_t g_dumpreq = 0;
+static int g_armed = 0;
+static uint32_t g_wp_pc[16]; static uint32_t g_wp_n = 0;   // watchpoint freeze ring
+static uint32_t g_sc_val[32], g_sc_res[32], g_sc_addr[32]; static uint32_t g_sc_n = 0;  // SC ring
+static void sigusr1_handler(int){ g_dumpreq = 1; }
 
 /* --- XPATH cross-path experiment (MIPS->ARM): the instant we see a console
  *     char (S00 leg) we read ring[xk] from DDR (M00 leg) and check ==xk. --- */
@@ -102,6 +108,21 @@ static inline bool read_char_fifo() {
   printf("%c", c==0 ? '\n' : c);
   mon_console_out(cc);
   std::fflush(nullptr);
+  /* Auto-quit at end-of-run so the guest can be looped unattended: the go/spec
+   * harness prints "fpga_done" and the kernel prints "reboot: Power down".
+   * Rolling tail buffer -> strstr for either sentinel, then clean exit (atexit
+   * restore_tty runs; the flock on /tmp/mips-axi.lock releases on process exit). */
+  {
+    static char et[32] = {0};
+    size_t n = strlen(et);
+    if(n >= sizeof(et) - 1) { memmove(et, et + 1, sizeof(et) - 2); n--; }
+    et[n] = (char)cc;
+    et[n + 1] = '\0';
+    if(strstr(et, "fpga_done") || strstr(et, "Power down")) {
+      std::fflush(nullptr);
+      exit(0);
+    }
+  }
   d->write32(0x3a, 1);
   d->write32(0x3a, 0);
   return true;
@@ -166,7 +187,32 @@ bool cmdline(int argc,
 	     bool &sgi_mode,
 	     bool &single_step,
 	     std::string &arcs_image,
-	     std::string &start_pc);
+	     std::string &start_pc,
+	     std::string &cimg_name);
+
+// Silicon checkpoint resume: replicate henry_tb's fpga_map so cimg pages land in DRAM
+// exactly where the core (via the AXI master's IP22 fold) will read them.
+static uint32_t cimg_fpga_map(uint32_t cpuaddr) {
+  if(cpuaddr >= 0x08000000u && cpuaddr <= 0x17ffffffu) return cpuaddr & 0x0fffffffu;
+  if(cpuaddr >= 0x1f000000u && cpuaddr <= 0x1fffffffu) return 0x10000000u | (cpuaddr & 0x00ffffffu);
+  return cpuaddr;
+}
+// Load a ckpt2preamble .cimg ([u64 icnt][u32 num][ {u32 pa,4096B} ..]) into DRAM.
+static void load_cimg(const char *path, uint8_t *cbase) {
+  FILE *f = fopen(path, "rb");
+  if(!f) { fprintf(stderr, "cannot open cimg %s\n", path); exit(-1); }
+  uint64_t icnt = 0; uint32_t n = 0;
+  if(fread(&icnt, 8, 1, f) != 1 || fread(&n, 4, 1, f) != 1) { fprintf(stderr, "bad cimg\n"); exit(-1); }
+  uint32_t loaded = 0;
+  for(uint32_t i = 0; i < n; i++) {
+    uint32_t va = 0; uint8_t data[4096];
+    if(fread(&va, 4, 1, f) != 1 || fread(data, 1, 4096, f) != 4096) break;
+    uint32_t off = cimg_fpga_map(va);
+    if((uint64_t)off + 4096 <= 0x1f000000ULL) { memcpy(cbase + off, data, 4096); loaded++; }
+  }
+  fclose(f);
+  printf("[cimg] loaded %u/%u pages into DRAM (base icnt=%llu)\n", loaded, n, (unsigned long long)icnt);
+}
 
 static void dump_registers(Driver *d) {
   printf("pc=%x cause=%u, sr %x |", d->read32(7), d->read32(0x26)&31, d->read32(0x16));
@@ -202,9 +248,10 @@ int main(int argc, char *argv[]) {
   std::string chpt_name;
   std::string arcs_image;
   std::string start_pc;
+  std::string cimg_name;
   rvstatus rs(0);
 
-  if(not(cmdline(argc, argv, initialize, silent, chpt_name, max_fetches, max_iters, sgi_mode, single_step, arcs_image, start_pc))) {
+  if(not(cmdline(argc, argv, initialize, silent, chpt_name, max_fetches, max_iters, sgi_mode, single_step, arcs_image, start_pc, cimg_name))) {
     return -1;
   }
 
@@ -212,6 +259,7 @@ int main(int argc, char *argv[]) {
    * diagnostic dump (last PC, core/L2/L1/AXI states, cycles-since-retire) prints
    * -- lets us snapshot a wedged/stuck boot instead of killing it blind. */
   signal(SIGINT, sigintHandler);
+  signal(SIGUSR1, sigusr1_handler);
 
   /* ---- board access lock ---------------------------------------------------
    * Only one program may drive the AXI core + the shared-DRAM mmap at a time.
@@ -265,8 +313,15 @@ int main(int argc, char *argv[]) {
   memset(vaddr, 0, memsize);
 
   d->write32(2, max_fetches);
-  
-  pc = loadelf(chpt_name.c_str(), c_addr, sgi_mode);
+
+  if(not(cimg_name.empty())) {
+    // checkpoint resume: memory from the .cimg, state from the --arcs 'preamble' blob.
+    load_cimg(cimg_name.c_str(), c_addr);
+    sgi_mode = true;        // need the IP22 MC (System Memory Alias + device map)
+    pc = 0xbfc00000;        // reset vector -> the preamble installs regs/CP0/TLB, ERETs
+  } else {
+    pc = loadelf(chpt_name.c_str(), c_addr, sgi_mode);
+  }
   printf("starting pc %x\n", pc);
   uint32_t *cptr = reinterpret_cast<uint32_t*>(&c_addr[pc]);
 
@@ -379,6 +434,194 @@ int main(int argc, char *argv[]) {
   FILE* g_trace=nullptr; int g_cdb_count=0; unsigned long g_nlog=0;
   while(c < max_iters && !done) {
     mon_poll();
+    if(!g_armed && (c & 0xFFFF)==0 && access("/tmp/ARMFATAL", F_OK)==0){
+      g_armed = 1;
+      d->write32(4, (8u|2u) | (1u<<17));   /* arm RTL fault-trap: bp_enable = ctrl bit17 */
+      fprintf(stderr, "### ARMFATAL armed (RTL fault-trap via bp_enable)\n");
+    }
+    if(!g_armed && (c & 0xFFFF)==0 && access("/tmp/ARMWP", F_OK)==0){
+      g_armed = 2;   /* watchpoint mode */
+      d->write32(10, 0x1006e984u);          /* bp_wp_addr = head slot s1+0x14 */
+      d->write32(4, (8u|2u) | (1u<<17));     /* arm bp_enable (watchpoint + fault-trap) */
+      fprintf(stderr, "### ARMWP armed: watch store EA==0x1006e984\n");
+    }
+    if(!g_armed && (c & 0xFFFF)==0 && access("/tmp/ARMWPV", F_OK)==0){
+      g_armed = 3;   /* value+addr watchpoint mode */
+      d->write32(10, 0x1006e984u);          /* bp_wp_addr = head slot s1+0x14 */
+      d->write32(11, 0x00000007u);          /* bp_wp_val = 7 (the corrupt value) */
+      d->write32(4, (8u|2u) | (1u<<17));     /* arm bp_enable */
+      fprintf(stderr, "### ARMWPV armed: freeze on store 7 -> 0x1006e984\n");
+    }
+    if(!g_armed && (c & 0xFFFF)==0 && access("/tmp/ARMSC", F_OK)==0){
+      g_armed = 4;
+      d->write32(9, 0x0fa59f1cu);            /* bp_pc = libc lock-free SC */
+      d->write32(4, (8u|2u) | (1u<<17));      /* arm bp_enable */
+      fprintf(stderr, "### ARMSC armed: break at malloc SC 0x0fa59f1c\n");
+    }
+    if(!g_armed && (c & 0xFFFF)==0 && access("/tmp/ARMHDR", F_OK)==0){
+      g_armed = 5;
+      d->write32(10, 0x100400c4u);           /* bp_wp_addr = mem[s5+4] = CAPACITY slot */
+      d->write32(11, 0xffffffffu);           /* wildcard: any store value */
+      d->write32(4, (8u|2u) | (1u<<17));       /* arm */
+      fprintf(stderr, "### ARMHDR armed: watch ANY store -> 0x1006e600 (array chunk header)\n");
+    }
+    if(!g_armed && (c & 0xFFFF)==0 && access("/tmp/ARMCAP", F_OK)==0){
+      g_armed = 6;
+      d->write32(9, 0x0e774158u);            /* bp_pc = array-insert grow-test (idx=gpr6, cap=gpr8 live) */
+      d->write32(4, (8u|2u) | (1u<<17));      /* arm bp_enable */
+      fprintf(stderr, "### ARMCAP armed: break @0e774158, watch idx(gpr6) vs cap(gpr8)\n");
+    }
+    if(g_armed==5){
+      const uint32_t CR = (8u|2u)|(1u<<17);
+      static uint32_t hpc[16], g_fcv[16]; static uint32_t hn=0;
+      uint32_t st = d->read32(0x26);
+      uint32_t cz = st & 31, wp_frz = (st>>9)&1, flt_frz = (st>>8)&1;
+      if(flt_frz || cz==4||cz==5||cz==6||cz==7||cz==10){
+        fprintf(stderr, "### HDR-FAULT cause=%u EPC=%08x BadVAddr=%08x (%u writes to 0x1006e600)\n",
+                cz, d->read32(0xb), d->read32(0xc), hn);
+        uint32_t base=(hn>16)?(hn-16):0;
+        for(uint32_t j=base;j<hn;j++) fprintf(stderr, "###   fc[%u] pc=%08x val=%08x\n", j, hpc[j&15], g_fcv[j&15]);
+        fflush(stderr); done=true;
+      } else if(wp_frz){
+        uint32_t p1 = d->read32(7); uint32_t val = d->read32(0x27);
+        hpc[hn&15]=p1; g_fcv[hn&15]=val; hn++;
+        if(val==0x1006e608u){   /* the grow that overlaps -- full context (realloc size in a0/regs) */
+          fprintf(stderr, "### BASE-GROW #%u frozen_pc=%08x val=%08x GPRs:", hn, p1, val);
+          for(int i=0;i<32;i++){ d->write32(14,i); fprintf(stderr, " r%d=%08x", i, d->read32(0xe)); }
+          fprintf(stderr, "\n"); fflush(stderr);
+        } else fprintf(stderr, "### CAP-WRITE #%u frozen_pc=%08x cap=%u (0x%08x)\n", hn, p1, val, val), fflush(stderr);
+        d->write32(4, CR|(1u<<18)); d->write32(4, CR);
+      }
+    }
+    if(g_armed==6){
+      const uint32_t CR = (8u|2u)|(1u<<17);
+      static uint32_t g_cap_n=0, g_cap_oob=0, g_cap_min=0xffffffff, g_cap_max=0;
+      uint32_t st = d->read32(0x26);
+      uint32_t cz = st & 31, bp_frz = (st>>10)&1, flt_frz = (st>>8)&1;
+      if(flt_frz || cz==4||cz==5||cz==6||cz==7||cz==10){
+        fprintf(stderr, "### CAP-FAULT cause=%u EPC=%08x BadVAddr=%08x (%u inserts, %u OOB; cap range %u..%u)\n",
+                cz, d->read32(0xb), d->read32(0xc), g_cap_n, g_cap_oob, g_cap_min, g_cap_max);
+        fflush(stderr); done=true;
+      } else if(bp_frz){
+        d->write32(14,6); uint32_t idx=d->read32(0xe);
+        d->write32(14,8); uint32_t cap=d->read32(0xe);
+        g_cap_n++;
+        if(cap<g_cap_min) g_cap_min=cap;
+        if(cap>g_cap_max && cap<0x10000) g_cap_max=cap;
+        if(idx>cap){ g_cap_oob++;
+          fprintf(stderr, "### OOB #%u: idx=%u > cap=%u  (insert #%u)\n", g_cap_oob, idx, cap, g_cap_n); fflush(stderr); }
+        else if((g_cap_n & 511)==0){ fprintf(stderr, "### insert #%u idx=%u cap=%u ok\n", g_cap_n, idx, cap); fflush(stderr); }
+        d->write32(4, CR|(1u<<30)); d->write32(4, CR);   /* step over the bp insn */
+        d->write32(4, CR|(1u<<18)); d->write32(4, CR);   /* resume to next insert */
+      }
+    }
+    if(g_armed==4){
+      const uint32_t CR = (8u|2u)|(1u<<17);
+      uint32_t st = d->read32(0x26);
+      uint32_t cz = st & 31, bp_frz = (st>>10)&1, flt_frz = (st>>8)&1;
+      if(flt_frz || cz==4||cz==5||cz==6||cz==7||cz==10){
+        fprintf(stderr, "### SC-FAULT cause=%u EPC=%08x BadVAddr=%08x (%u SCs seen)\n",
+                cz, d->read32(0xb), d->read32(0xc), g_sc_n);
+        uint32_t base=(g_sc_n>24)?(g_sc_n-24):0;
+        for(uint32_t j=base;j<g_sc_n;j++)
+          fprintf(stderr, "###   SC[%u] addr=%08x val=%08x result=%u\n", j, g_sc_addr[j&31], g_sc_val[j&31], g_sc_res[j&31]);
+        fflush(stderr); done=true;
+      } else if(bp_frz){
+        d->write32(14,1);  uint32_t val  = d->read32(0xe);   /* at = value to store (pre-SC) */
+        d->write32(14,3);  uint32_t addr = d->read32(0xe);   /* v1 = lock addr */
+        d->write32(4, CR|(1u<<30)); d->write32(4, CR);       /* step: execute the SC */
+        d->write32(14,1);  uint32_t res  = d->read32(0xe);   /* at = SC result (1 succ / 0 fail) */
+        g_sc_val[g_sc_n&31]=val; g_sc_res[g_sc_n&31]=res; g_sc_addr[g_sc_n&31]=addr; g_sc_n++;
+        if((g_sc_n & 1023)==0){ fprintf(stderr, "### SCs so far: %u (last val=%08x res=%u)\n", g_sc_n, val, res); fflush(stderr); }
+        d->write32(4, CR|(1u<<18)); d->write32(4, CR);       /* resume to next SC */
+      }
+    }
+    if(g_armed==3){
+      const uint32_t CR = (8u|2u)|(1u<<17);
+      uint32_t st = d->read32(0x26);
+      uint32_t cz = st & 31, wp_frz = (st>>9)&1, flt_frz = (st>>8)&1;
+      if(flt_frz || cz==4||cz==5||cz==6||cz==7||cz==10){
+        /* the be fault -- dump the writer ring (last 16 real 7-writes). */
+        uint32_t p1 = d->read32(7);
+        fprintf(stderr, "### WPV-FAULT cause=%u EPC=%08x BadVAddr=%08x pc=%08x (%u real 7-writes to slot)\n",
+                cz, d->read32(0xb), d->read32(0xc), p1, g_wp_n);
+        uint32_t base=(g_wp_n>16)?(g_wp_n-16):0;
+        for(uint32_t j=base;j<g_wp_n;j++) fprintf(stderr, "###   7-write[%u] frozen_pc=%08x\n", j, g_wp_pc[j&15]);
+        fflush(stderr); done=true;
+      } else if(wp_frz){
+        /* REAL 7-write freeze (r_wp_hit set) -- no stall false-positive.  Compact ring-log
+         * the frozen (retire-trailing) PC + a couple GPRs; the last one before the fault
+         * names the writer region.  (Follow-up run full-dumps a specific one if needed.) */
+        uint32_t p1 = d->read32(7);
+        g_wp_pc[g_wp_n & 15] = p1; g_wp_n++;
+        fprintf(stderr, "### WPV-HIT #%u frozen_pc=%08x GPRs:", g_wp_n, p1);
+        for(int i=0;i<32;i++){ d->write32(14,i); fprintf(stderr, " r%d=%08x", i, d->read32(0xe)); }
+        fprintf(stderr, "\n"); fflush(stderr);
+        d->write32(4, CR|(1u<<18)); d->write32(4, CR);   /* resume to next real 7-write */
+      }
+    }
+    if(g_armed==2){
+      const uint32_t CR = (8u|2u)|(1u<<17);
+      uint32_t p1 = d->read32(7), p2 = d->read32(7);
+      if(p1==p2){            /* frozen (running core would retire thousands between reads) */
+        uint32_t cz = d->read32(0x26) & 31;
+        if(cz==4||cz==5||cz==6||cz==7||cz==10){
+          fprintf(stderr, "### WP-FAULT cause=%u EPC=%08x BadVAddr=%08x pc=%08x  (%u wp fires)\n",
+                  cz, d->read32(0xb), d->read32(0xc), p1, g_wp_n);
+          uint32_t base = (g_wp_n>16)?(g_wp_n-16):0;
+          for(uint32_t j=base;j<g_wp_n;j++)
+            fprintf(stderr, "###   wp[%u] frozen_pc=%08x\n", j, g_wp_pc[j&15]);
+          fflush(stderr); done = true;
+        } else {
+          g_wp_pc[g_wp_n & 15] = p1; g_wp_n++;
+          d->write32(14,16); uint32_t r16 = d->read32(0xe);   /* s0 = head-store data */
+          d->write32(14,8);  uint32_t r8  = d->read32(0xe);   /* t0 = count-store data */
+          int head_bad  = (r16!=0 && r16 < 0x1000u);
+          int cnt_store = (p1 >= 0x0e6818b8u && p1 <= 0x0e6818dcu);
+          if(head_bad || cnt_store){
+            fprintf(stderr, "### WP-ANOM fire#%u frozen_pc=%08x s0(r16)=%08x t0(r8)=%08x %s%s\n",
+                    g_wp_n, p1, r16, r8, head_bad?"[HEAD-VAL-BAD]":"", cnt_store?"[COUNT-STORE-MISADDR]":"");
+            fflush(stderr);
+          }
+          if((g_wp_n & 4095)==0){ fprintf(stderr, "### wp fires so far: %u (last pc=%08x s0=%08x)\n", g_wp_n, p1, r16); fflush(stderr); }
+          d->write32(4, CR|(1u<<18)); d->write32(4, CR);   /* resume: clear wp_hit, run to next */
+        }
+      }
+    }
+    if(g_armed){
+      static int n_trap = 0; const int STEP_N = 8;
+      uint32_t cz = d->read32(0x26) & 31;
+      /* RTL froze the core at a fatal userspace fault -> {epc,cause,badvaddr,GPRs} STABLE */
+      if(cz==4||cz==5||cz==6||cz==7||cz==10){
+        uint32_t epc = d->read32(0xb), bv = d->read32(0xc), pc = d->read32(7);
+        fprintf(stderr, "### BEFAULT[%d] cause=%u EPC=%08x BadVAddr=%08x pc=%08x\n", n_trap, cz, epc, bv, pc);
+        fprintf(stderr, "### GPRs[%d]:", n_trap);
+        for(int i=0;i<32;i++){ d->write32(14,i); fprintf(stderr, " r%d=%08x", i, d->read32(0xe)); }
+        fprintf(stderr, "\n"); fflush(stderr);
+        fprintf(stderr, "### MEM node@1003f820(PA9473820)= %08x %08x %08x %08x | head[s1+20]@PA92f596c= %08x\n",
+                rdbe(0x9473820), rdbe(0x9473824), rdbe(0x9473828), rdbe(0x947382c), rdbe(0x92f596c));
+        fflush(stderr);
+        n_trap++;
+        if(n_trap >= STEP_N){ done = true; }
+        else {
+          /* step to the next fault: pulse fault_clear (bit18), keep armed (bit17) */
+          d->write32(4, (8u|2u) | (1u<<17) | (1u<<18));
+          d->write32(4, (8u|2u) | (1u<<17));
+        }
+      }
+    }
+    if(g_dumpreq){
+      d->write32(4, 8|2|(1u<<31));            /* halt: single-step mode = freeze */
+      fprintf(stderr, "\n### HALT-DUMP: cause=%u pc=%08x sr=%08x\n",
+              d->read32(0x26)&31, d->read32(7), d->read32(0x16));
+      dump_registers(d);
+      dump_trace(d);
+      unsigned long long base = 0x08000000ULL, len = 0x04000000ULL; /* PA 0x08M..0x0CM (64MB) */
+      FILE *df = fopen("/tmp/dram_dump.img", "wb");
+      if(df){ size_t w = fwrite(c_addr + base, 1, len, df); fclose(df);
+              fprintf(stderr, "[dump] wrote %zu bytes (PA base 0x%llx) to /tmp/dram_dump.img (core halted)\n", w, base); }
+      g_dumpreq = 0;
+    }
 #ifdef CLAUDE_DEBUG
     if(g_trace){
       d->write32(4, cr | (1u<<30));   /* rising edge -> retire ~1 */

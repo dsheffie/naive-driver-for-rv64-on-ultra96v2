@@ -13,7 +13,8 @@ bool cmdline(int argc,
 	     bool &sgi_mode,
 	     bool &single_step,
 	     std::string &arcs_image,
-	     std::string &start_pc) {
+	     std::string &start_pc,
+	     std::string &cimg_name) {
   
   namespace po = boost::program_options;
   po::options_description desc("Options");  
@@ -28,6 +29,7 @@ bool cmdline(int argc,
     ("step,s", po::value<bool>(&single_step)->default_value(false), "single-step")
     ("arcs", po::value<std::string>(&arcs_image)->default_value(""), "arcs firmware image to load at phys 0x1000 (empty = none; arcs_fw.bin for Linux, arcs_irix.bin for IRIX)")
     ("start-pc", po::value<std::string>(&start_pc)->default_value(""), "override start PC, e.g. 0xa0003000 (empty = ELF entry / sgi default)")
+    ("cimg", po::value<std::string>(&cimg_name)->default_value(""), "checkpoint memory image (ckpt2preamble .cimg); skips ELF, forces sgi + pc=0xbfc00000, load preamble via --arcs")
     ;
   try {
     po::variables_map vm;
