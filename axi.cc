@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <termios.h>
 #include "scsi_arm.h"
+#include "enet_arm.h"
 
 #include <iostream>
 #include <fstream>
@@ -415,7 +416,12 @@ int main(int argc, char *argv[]) {
   { const char* e = getenv("SELDELAY"); int sd = e ? atoi(e) : 65535;
     d->write32(SCSI_W_SELDELAY, (uint32_t)sd);
     printf("[rtl] SELDELAY set to %d\n", sd); }
-  printf("[rtl] revision = %08x (expect 20260629)\n", d->read32(SCSI_R_RTLREV));
+  printf("[rtl] revision = %08x (expect 20260721)\n", d->read32(SCSI_R_RTLREV));
+
+  /* --- ENET tap service (PS side); host end is tap0 = 192.168.7.1/24 --- */
+  enet_tap g_enet_tap;
+  { const char* et = getenv("ENETTAP"); g_enet_tap.open_tap(et ? et : "tap0"); }   /* absent tap => ENET idle (poll no-ops) */
+
   { const char* mp = getenv("MONPORT"); mon_init(d, mp ? atoi(mp) : 2323); }
 
   /* --- PS<->PL ping-pong producer (experiment): write DATA then SEQ (1MB apart,
@@ -661,7 +667,7 @@ int main(int argc, char *argv[]) {
       pump_stdin_to_rx();
       
       const bool scsi_serviced = scsi_arm_poll(d, &g_scsi_disk, c_addr);
-      (void)scsi_serviced;   // always service the disk; below is debug-only
+      const bool enet_serviced = enet_arm_poll(d, &g_enet_tap, c_addr);   /* bridge the ENET mailbox <-> tap0 */
 #ifdef CLAUDE_DEBUG
       if(scsi_serviced){
         static const bool g_pctrace = getenv("PCTRACE") != nullptr;
@@ -725,10 +731,10 @@ int main(int argc, char *argv[]) {
 	  }
       }
 #endif
-      if(not(new_c)) {
+      if(not(new_c) && not(scsi_serviced) && not(enet_serviced)) {
 	usleep(us_amt);
 	us_amt = std::min(us_amt+1, 1000);
-	///printf("last pc = %x, insn cnt %u\n", d->read32(7), d->read32(0));	
+	///printf("last pc = %x, insn cnt %u\n", d->read32(7), d->read32(0));
       }
       else {
 	us_amt = 1;
