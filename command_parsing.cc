@@ -14,7 +14,8 @@ bool cmdline(int argc,
 	     bool &single_step,
 	     std::string &arcs_image,
 	     std::string &start_pc,
-	     std::string &cimg_name) {
+	     std::string &cimg_name,
+	     std::string &disk_name) {
   
   namespace po = boost::program_options;
   po::options_description desc("Options");  
@@ -30,6 +31,7 @@ bool cmdline(int argc,
     ("arcs", po::value<std::string>(&arcs_image)->default_value(""), "arcs firmware image to load at phys 0x1000 (empty = none; arcs_fw.bin for Linux, arcs_irix.bin for IRIX)")
     ("start-pc", po::value<std::string>(&start_pc)->default_value(""), "override start PC, e.g. 0xa0003000 (empty = ELF entry / sgi default)")
     ("cimg", po::value<std::string>(&cimg_name)->default_value(""), "checkpoint memory image (ckpt2preamble .cimg); skips ELF, forces sgi + pc=0xbfc00000, load preamble via --arcs")
+    ("disk", po::value<std::string>(&disk_name)->default_value("/home/root/irix65-clean.img"), "disk image")
     ;
   try {
     po::variables_map vm;

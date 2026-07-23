@@ -64,6 +64,11 @@ static bool     xpath_mode = false, x_started = false;
 static unsigned xk = 0, x_ok = 0, x_bad = 0, x_shown = 0;
 static bool done = false;
 
+
+scsi_disk g_scsi_disk;
+enet_tap g_enet_tap;
+
+
 inline bool cpu_stopped(const rvstatus &rs) {
   return rs.s.break_ or rs.s.ud or rs.s.bad_addr or rs.s.monitor;
 }
@@ -119,7 +124,7 @@ static inline bool read_char_fifo() {
     if(n >= sizeof(et) - 1) { memmove(et, et + 1, sizeof(et) - 2); n--; }
     et[n] = (char)cc;
     et[n + 1] = '\0';
-    if(strstr(et, "fpga_done") || strstr(et, "Power down")) {
+    if(strstr(et, "fpga_done") /*|| strstr(et, "Power down")*/) {
       std::fflush(nullptr);
       exit(0);
     }
@@ -189,7 +194,8 @@ bool cmdline(int argc,
 	     bool &single_step,
 	     std::string &arcs_image,
 	     std::string &start_pc,
-	     std::string &cimg_name);
+	     std::string &cimg_name,
+	     std::string &disk_name);
 
 // Silicon checkpoint resume: replicate henry_tb's fpga_map so cimg pages land in DRAM
 // exactly where the core (via the AXI master's IP22 fold) will read them.
@@ -249,10 +255,11 @@ int main(int argc, char *argv[]) {
   std::string chpt_name;
   std::string arcs_image;
   std::string start_pc;
-  std::string cimg_name;
+  std::string cimg_name, disk_name;
   rvstatus rs(0);
+  /* --- SCSI disk service (PS side) --- */
 
-  if(not(cmdline(argc, argv, initialize, silent, chpt_name, max_fetches, max_iters, sgi_mode, single_step, arcs_image, start_pc, cimg_name))) {
+  if(not(cmdline(argc, argv, initialize, silent, chpt_name, max_fetches, max_iters, sgi_mode, single_step, arcs_image, start_pc, cimg_name, disk_name))) {
     return -1;
   }
 
@@ -410,16 +417,16 @@ int main(int argc, char *argv[]) {
   *halt_flag = 0;
   uint32_t magic_flag = 0, core_halt_u = 0; bool core_halted = false;
   
-  /* --- SCSI disk service (PS side) --- */
-  scsi_disk g_scsi_disk;
-  { const char* di = getenv("SCSIDISK"); g_scsi_disk.open_image(di ? di : "/home/root/irix65-clean.img"); }   /* root disk; absent => disk-less (no device) */
+  
+  g_scsi_disk.open_image(disk_name.c_str(), O_RDWR);
+  
   { const char* e = getenv("SELDELAY"); int sd = e ? atoi(e) : 65535;
     d->write32(SCSI_W_SELDELAY, (uint32_t)sd);
     printf("[rtl] SELDELAY set to %d\n", sd); }
   printf("[rtl] revision = %08x (expect 20260721)\n", d->read32(SCSI_R_RTLREV));
 
   /* --- ENET tap service (PS side); host end is tap0 = 192.168.7.1/24 --- */
-  enet_tap g_enet_tap;
+
   { const char* et = getenv("ENETTAP"); g_enet_tap.open_tap(et ? et : "tap0"); }   /* absent tap => ENET idle (poll no-ops) */
 
   { const char* mp = getenv("MONPORT"); mon_init(d, mp ? atoi(mp) : 2323); }

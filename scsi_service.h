@@ -23,7 +23,7 @@
 #include <cstdint>
 #include <vector>
 #include <array>
-#include <unordered_map>
+#include <map>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -32,38 +32,129 @@ typedef uint8_t *(*scsi_mem_fn)(void *ctx, uint32_t phys, uint32_t len);
 
 /* ---- disk backend: read-only image + in-memory copy-on-write overlay ---- */
 struct scsi_disk {
-    int      fd = -1;
-    uint64_t nblocks = 0;
-    std::unordered_map<uint64_t, std::array<uint8_t,512>> overlay;   /* COW writes */
+  int      fd = -1, mode = -1;
+  uint64_t nblocks = 0;
+  std::map<uint64_t, std::array<uint8_t,512>> overlay;   /* COW writes */
 
-    bool open_image(const char *path) {
-        fd = ::open(path, O_RDONLY);
-        if(fd < 0) { fprintf(stderr, "scsi_disk: cannot open %s\n", path); return false; }
-        struct stat st;
-        if(::fstat(fd, &st) == 0) nblocks = (uint64_t)st.st_size / 512;
-        fprintf(stderr, "scsi_disk: %s -- %llu blocks (%llu MB)\n", path,
-                (unsigned long long)nblocks, (unsigned long long)(nblocks/2048));
-        return true;
+  /* XFS safety (learned once from the base image by scan_xfs) */
+  std::vector<uint64_t> xfs_sb_lbas;              /* superblock LBAs (one per AG) */
+  uint64_t xfs_log_lba0 = 0, xfs_log_lba1 = 0;    /* internal-log LBA range */
+  bool     xfs_scanned  = false;
+
+  bool open_image(const char *path, int m = O_RDONLY) {
+    fd = ::open(path, m);
+    mode = m;
+    if(fd < 0) {
+      fprintf(stderr, "scsi_disk: cannot open %s\n", path);
+      return false;
     }
-    bool ok() const { return fd >= 0; }
+    struct stat st;
+    if(::fstat(fd, &st) == 0) nblocks = (uint64_t)st.st_size / 512;
+    fprintf(stderr, "scsi_disk: %s -- %llu blocks (%llu MB)\n", path,
+	    (unsigned long long)nblocks, (unsigned long long)(nblocks/2048));
+    return true;
+  }
+  bool ok() const { return fd >= 0; }
 
-    void block_read(uint64_t lba, uint8_t *dst) {           /* overlay wins, else image, else zero */
-        static const bool g_scsi_synth = getenv("SCSI_SYNTH") != nullptr;
-        if(g_scsi_synth) {   /* experiment: per-LBA sentinel content [DA 7A hi lo] */
-            if(lba < nblocks) { ssize_t r = ::pread(fd, dst, 512, (off_t)lba * 512); (void)r; }  /* keep real read latency */
-            for(int i = 0; i < 512; i += 4) {
-                dst[i]=0xDA; dst[i+1]=0x7A; dst[i+2]=(uint8_t)(lba>>8); dst[i+3]=(uint8_t)lba;
-            }
-            return;
+  void block_read(uint64_t lba, uint8_t *dst) {           /* overlay wins, else image, else zero */
+    static const bool g_scsi_synth = getenv("SCSI_SYNTH") != nullptr;
+    if(g_scsi_synth) {   /* experiment: per-LBA sentinel content [DA 7A hi lo] */
+      if(lba < nblocks) { ssize_t r = ::pread(fd, dst, 512, (off_t)lba * 512); (void)r; }  /* keep real read latency */
+      for(int i = 0; i < 512; i += 4) {
+	dst[i]=0xDA; dst[i+1]=0x7A; dst[i+2]=(uint8_t)(lba>>8); dst[i+3]=(uint8_t)lba;
+      }
+      return;
+    }
+    auto it = overlay.find(lba);
+    if(it != overlay.end()) {
+      memcpy(dst, it->second.data(), 512);
+      return;
+    }
+    if(lba < nblocks && ::pread(fd, dst, 512, (off_t)lba * 512) == 512) return;
+    memset(dst, 0, 512);
+  }
+  void block_write(uint64_t lba, const uint8_t *src) {    /* writes go ONLY to the overlay */
+    std::array<uint8_t,512> b; memcpy(b.data(), src, 512); overlay[lba] = b;
+  }
+  size_t overlay_size() const {
+    return overlay.size();
+  }
+  /* one-time: learn the XFS superblock LBAs + internal-log LBA range from the base
+   * image (geometry is fixed for the fs, so reading the base image is correct even
+   * once the overlay holds newer SB content). SGI volume header (LBA 0) gives
+   * partition 0's start; the XFS primary superblock there gives the AG geometry. */
+  void scan_xfs() {
+    xfs_scanned = true;
+    auto be32 = [](const uint8_t*p){ return (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<8 | p[3]; };
+    auto be64 = [](const uint8_t*p){ uint64_t v=0; for(int i=0;i<8;i++) v=(v<<8)|p[i]; return v; };
+    uint8_t vh[512];
+    if(::pread(fd, vh, 512, 0) != 512) return;
+    uint32_t p0 = be32(vh + 0x138 + 4);                       /* SGI vh: partition 0 first_lba */
+    uint8_t sb[512];
+    if(::pread(fd, sb, 512, (off_t)p0 * 512) != 512) return;
+    if(!(sb[0]=='X' && sb[1]=='F' && sb[2]=='S' && sb[3]=='B')) return;   /* not XFS -> guard stays off */
+    uint32_t blocksize = be32(sb+4), agblocks = be32(sb+0x54), agcount = be32(sb+0x58);
+    uint32_t logblocks = be32(sb+0x60); uint8_t agblklog = sb[0x7c];
+    uint64_t logstart = be64(sb+0x30);
+    uint64_t stride = (uint64_t)agblocks * blocksize / 512;
+    for(uint32_t ag = 0; ag < agcount; ag++) xfs_sb_lbas.push_back((uint64_t)p0 + (uint64_t)ag * stride);
+    if(logstart) {
+      uint64_t agno   = logstart >> agblklog;
+      uint64_t agbno  = logstart & (((uint64_t)1 << agblklog) - 1);
+      uint64_t linblk = agno * agblocks + agbno;
+      xfs_log_lba0 = (uint64_t)p0 + linblk * blocksize / 512;
+      xfs_log_lba1 = xfs_log_lba0 + (uint64_t)logblocks * blocksize / 512 - 1;
+    }
+    fprintf(stderr, "[xfs] part0@%u, %u AGs (SB stride %llu), log LBA [%llu..%llu]\n",
+            p0, agcount, (unsigned long long)stride,
+            (unsigned long long)xfs_log_lba0, (unsigned long long)xfs_log_lba1);
+  }
+  void flush() {
+    if(mode == O_RDONLY) {
+      return;
+    }
+    if(!xfs_scanned) scan_xfs();
+    /* SB guard: never persist a garbage block over an XFS superblock (a torn write
+     * loses the XFSB magic) -> abort the whole flush rather than destroy the fs. */
+    for(uint64_t sblba : xfs_sb_lbas) {
+      auto it = overlay.find(sblba);
+      if(it != overlay.end()) {
+        const uint8_t *b = it->second.data();
+        if(!(b[0]=='X' && b[1]=='F' && b[2]=='S' && b[3]=='B')) {
+          fprintf(stderr, "diskwb ABORT: overlay for XFS SB LBA %llu lacks XFSB magic "
+                  "(%02x%02x%02x%02x) -- refusing to persist a corrupt filesystem\n",
+                  (unsigned long long)sblba, b[0], b[1], b[2], b[3]);
+          return;
         }
-        auto it = overlay.find(lba);
-        if(it != overlay.end()) { memcpy(dst, it->second.data(), 512); return; }
-        if(lba < nblocks && ::pread(fd, dst, 512, (off_t)lba * 512) == 512) return;
-        memset(dst, 0, 512);
+      }
     }
-    void block_write(uint64_t lba, const uint8_t *src) {    /* writes go ONLY to the overlay */
-        std::array<uint8_t,512> b; memcpy(b.data(), src, 512); overlay[lba] = b;
+    /* log warning: persisting log blocks is only safe after a clean unmount. */
+    if(xfs_log_lba1) {
+      for(auto &p : overlay) {
+        if(p.first >= xfs_log_lba0 && p.first <= xfs_log_lba1) {
+          fprintf(stderr, "diskwb WARNING: overlay includes XFS log blocks (LBA %llu..%llu). "
+                  "Persist ONLY after a clean IRIX shutdown (Power down) or the log may be "
+                  "torn -> 'bad clientid' on next mount.\n",
+                  (unsigned long long)xfs_log_lba0, (unsigned long long)xfs_log_lba1);
+          break;
+        }
+      }
     }
+    printf("%lu lbas to write back\n", overlay.size());
+    for(auto &p : overlay) {
+      uint64_t lba = p.first;
+      if(lba >= nblocks) {
+	printf("huh block %lu out of outbounds\n", lba);
+	continue;
+      }
+      uint8_t *data = reinterpret_cast<uint8_t*>(p.second.data());
+      //printf("writing lba %lu\n", lba);
+      ssize_t r = ::pwrite(fd, data, 512, static_cast<off_t>(lba*512));
+      assert(r == 512);
+    }
+    fsync(fd);
+    overlay.clear();
+  }
 };
 
 /* ---- move `n` bytes between a host buffer and the descriptor-chain'd DRAM buffers.

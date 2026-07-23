@@ -23,8 +23,12 @@
 #include <cstdlib>
 #include <cstdint>
 #include "scsi_lastcmd.h"
+#include "scsi_service.h"
 
 scsi_lastcmd_t g_last_scsi;              /* filled by scsi_arm; dumped by "scsi" */
+
+extern scsi_disk g_scsi_disk;
+
 static Driver *g_d = nullptr;
 static int g_listen = -1;
 static int g_client = -1;
@@ -106,6 +110,17 @@ static void mon_cmd(char *line) {
   else if(!strncmp(line, "help", 4) || line[0] == '?') {
     mon_send(g_help);
   }
+  else if(!strncmp(line, "diskwb", 6)) {
+    g_scsi_disk.flush();
+    snprintf(out, sizeof(out), "flushed model disk\r\n");
+    mon_send(out);
+  }
+  else if(!strncmp(line, "overlay", 6)) {
+    uint64_t n_lbas = g_scsi_disk.overlay_size();
+    snprintf(out, sizeof(out), "overlay has %lu lbas\r\n", n_lbas);
+    mon_send(out);
+  }  
+  
   else if(!strncmp(line, "scsi", 4) || !strncmp(line, "dump", 4)) {
     /* full viz into the last-serviced SCSI command (filled by scsi_arm).
      * moved<disk (residual!=0) == a multi-segment HPC3 DMA the shim only
