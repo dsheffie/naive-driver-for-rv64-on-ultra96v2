@@ -45,6 +45,25 @@ enum {
   SCSI_W_RSP_SEQ  = 0x0D, SCSI_W_RESID = 0x0F, SCSI_W_STATUS = 0x10, SCSI_W_SELDELAY = 0x11,
 };
 
+/* ---- DMA write-range log: physical byte-ranges SCSI DEPOSITED into DRAM (READ = disk->DRAM).
+ * Cross-checked at a crash catch (axi.cc) -- was the poison's physical page recently SCSI-DMA'd?
+ * (page-reuse + stale-L1 hypothesis).  scsi_arm.h is #included only in axi.cc, so these file-scope
+ * statics are shared with the catch handler. ---- */
+/* per-physical-4KB-page "ever SCSI-DMA'd" bitmap: complete history (no ring wrap).
+ * 512MB SCSI_DRAM_WINDOW / 4KB = 128K pages -> 16KB bitmap. */
+static const uint32_t SCSI_DMA_NPAGES = 512u*1024u*1024u / 4096u;   /* 131072 */
+static uint8_t  g_scsi_dma_pgbmp[SCSI_DMA_NPAGES / 8];              /* 16 KB */
+static uint32_t g_scsi_dma_n = 0;         /* total DMA ranges logged (for reporting) */
+static inline void scsi_dma_log_add(uint32_t pa, uint32_t len) {
+  uint32_t p0 = pa >> 12, p1 = (pa + len + 0xfffu) >> 12;
+  for(uint32_t p = p0; p < p1 && p < SCSI_DMA_NPAGES; p++) g_scsi_dma_pgbmp[p >> 3] |= (uint8_t)(1u << (p & 7));
+  g_scsi_dma_n++;
+}
+static inline bool scsi_dma_page_seen(uint32_t pa) {
+  uint32_t p = pa >> 12;
+  return p < SCSI_DMA_NPAGES && (g_scsi_dma_pgbmp[p >> 3] & (1u << (p & 7)));
+}
+
 /* FPGA AXI DRAM address map -- MUST match henry_tb fpga_map / the M00_AXI fold.
  * A guest physical address (descriptor BP/DP, the chain head NBDP) maps to a
  * DRAM-window offset, then to the host pointer get_vaddr()+offset. */
@@ -137,6 +156,16 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
   if(g_active) {
     moved = scsi_move(scsi_arm_mem, dram, req.nbdp,
                       g_buf.data() + g_pos, (uint32_t)(g_total - g_pos), g_to_dev);
+    if(!g_to_dev && moved) {                     /* READ: log the physical DRAM ranges we deposited */
+      uint32_t nb = req.nbdp, done = 0;
+      for(int gd = 0; gd < 128 && nb && done < moved; gd++) {
+        uint8_t *dd = scsi_arm_mem(dram, nb, 12); if(!dd) break;
+        uint32_t bp = hdma_be32(dd+0), bc = hdma_be32(dd+4);
+        uint32_t cnt = bc & HPC3_BC_COUNT; if(cnt > moved - done) cnt = moved - done;
+        if(cnt) scsi_dma_log_add(bp, cnt);
+        done += cnt; if(bc & HPC3_BC_EOX) break; nb = hdma_be32(dd+8);
+      }
+    }
     if(g_to_dev) {                               /* WRITE: commit the chunk just read */
       size_t nb = moved / 512, base = g_pos / 512;
       for(size_t b = 0; b < nb; b++)

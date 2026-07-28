@@ -94,7 +94,7 @@ void mon_console_out(int c) {
 }
 
 static const char *g_help =
-  "monitor: s(tate) pc epc regs r<N> trace[N] l2trace[N] head reset halt go step[N] ret perf scsi help  c/empty=console\r\n";
+  "monitor: s(tate) pc epc regs r<N> trace[N] l2trace[N] arm disarm exc head reset halt go step[N] ret perf scsi help  c/empty=console\r\n";
 
 static void mon_cmd(char *line) {
   Driver *d = g_d;
@@ -261,6 +261,57 @@ static void mon_cmd(char *line) {
                e, w[0], (fl>>28)&0xf, (fl>>6)&1, (fl>>5)&1, fl&0x1f, w[3], w[2]);
       mon_send(out);
     }
+  }
+  else if(!strncmp(line, "exc", 3)) {
+    /* Exception ring (core.sv): FATAL-only faults (AdEL/AdES/IBE/DBE/RI), armed by
+     * bp_enable (ctrl bit17, built with the freeze-watchpoint OFF so it's a pure arm).
+     * index bit10 selects it; entry=index[6:3] (16 deep), word=index[2:0] (6 words).
+     * regs: 0x17=write index, 0x18=data, 0x19=wptr.
+     *   w0=cause w1=epc w2=badvaddr w3=cycle w4={opcode[31:24],flags} w5=FETCHED insn.
+     * KEY: diff w5 (what the core actually DECODED) vs the binary/golden at w1 --
+     * a mismatch is I-side fetch corruption; match-but-faulted is decode/rename. */
+    d->write32(0x17, 0x400);                 /* select exc ring so 0x19 returns its wptr */
+    unsigned wptr = d->read32(0x19) & 0xf;
+    snprintf(out, sizeof(out), "=== EXC RING (fatal-only) next-slot=%u ===\r\n", wptr);
+    mon_send(out);
+    for(int e = 0; e < 16; e++) {
+      unsigned w[6];
+      for(int k = 0; k < 6; k++) {
+        d->write32(0x17, 0x400u | ((unsigned)e << 3) | k);
+        w[k] = d->read32(0x18);
+      }
+      unsigned cause = w[0] & 0x1f;
+      if(cause == 0) {
+        continue;                            /* empty slot (no fatal cause is 0) */
+      }
+      const char *cn = cause==4?"AdEL": cause==5?"AdES": cause==6?"IBE":
+                       cause==7?"DBE":  cause==10?"RI":  "?";
+      unsigned uop = w[4];
+      snprintf(out, sizeof(out),
+        "e%-2d cyc=%u cause=%u(%s) epc=%08x bad=%08x op=%u [%s%s%s%s%s%s%s%s%s] fetched=%08x\r\n",
+        e, w[3], cause, cn, w[1], w[2], (uop>>24)&0xff,
+        (uop>>23)&1?"flt ":"",   (uop>>22)&1?"ii ":"",    (uop>>21)&1?"cpu ":"",
+        (uop>>20)&1?"st ":"",    (uop>>19)&1?"badva ":"",  (uop>>18)&1?"ds ":"",
+        (uop>>17)&1?"tlbR ":"",  (uop>>16)&1?"tlbI ":"",   (uop>>15)&1?"tlbM ":"",
+        w[5]);
+      mon_send(out);
+    }
+  }
+  else if(!strncmp(line, "arm", 3)) {
+    /* Arm the exception ring: set bp_enable (ctrl bit17) in the cached control word,
+     * preserving the run/halt bits. The RTL holds r_exc_wptr at 0 while ~bp_enable, so
+     * arming auto-CLEARS the ring and starts a fresh capture from entry 0. Record-only
+     * (watchpoint compiled out) -> no freeze, no AXI wedge. Read with 'exc' afterward. */
+    g_cr |= (1u << 17);
+    d->write32(4, g_cr);
+    mon_send("[exc ring ARMED (bp_enable=1) -- ring cleared; run be, then 'exc']\r\n");
+  }
+  else if(!strncmp(line, "disarm", 6)) {
+    /* Clear bp_enable -> stop capturing AND reset the write pointer. Read 'exc' BEFORE
+     * disarming (disarm zeroes the ring's next-slot). */
+    g_cr &= ~(1u << 17);
+    d->write32(4, g_cr);
+    mon_send("[exc ring DISARMED (bp_enable=0) -- ring pointer reset]\r\n");
   }
   else if(!strncmp(line, "reset", 5)) {
     /* Reset the core and leave it HALTED at the reset vector, ready to step out

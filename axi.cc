@@ -45,6 +45,10 @@
 #define MB ((1UL<<20))
 
 static const uint32_t control = 0xA0050000;
+static uint32_t g_l2nc = 0;   /* ctrl bit20 = L2 no-cache (set BEFORE go via L2_NOCACHE env); OR'd into every control write */
+static uint32_t g_deeptrace = 0;  /* ctrl bit21 = DRAM control-flow deep trace (TRACE_DEEP env); OR'd into control writes so it survives re-arms */
+static const bool g_characterize = getenv("RT_CHARACTERIZE") != nullptr;
+static const bool g_bp_dump = getenv("RT_BP_DUMP") != nullptr;  /* ARMRT: a bp_pc retire-match ALWAYS dumps+stops (backward-window catch on an off-golden trigger pc) */  /* ARMRT: log each crash's sp/VA + re-arm (many samples/boot) instead of full-dump+stop */
 
 
 static const uint64_t memsize = 496*MB;
@@ -227,6 +231,22 @@ static void dump_registers(Driver *d) {
   printf("\n");
 }
 
+/* DRAM control-flow deep trace: read the ring back from shared DRAM (0x18000000) and
+ * write the raw {from,to} records to a file for offline rept_align_df.py. */
+static void dump_dram_trace(Driver* d) {
+  const uint32_t BASE   = 0x18000000u;
+  const uint32_t RINGSZ = 112u*1024u*1024u;            /* 64 MB (dram_trace TRACE_MASK) */
+  uint32_t wbytes = d->read32(0x1c);                  /* trace_ring_wptr: total bytes written */
+  bool     ovf    = (d->read32(0x26) >> 11) & 1u;     /* 0x26 bit11 = trace_overflow */
+  uint32_t n = (wbytes < RINGSZ) ? wbytes : RINGSZ;
+  const char* path = getenv("TRACE_DEEP_FILE"); if(!path) path = "/mnt/rttrace/deep.bin";
+  FILE* fp = fopen(path, "wb");
+  if(!fp){ fprintf(stderr,"### DEEP-TRACE: cannot open %s\n", path); return; }
+  fwrite(c_addr + BASE, 1, n, fp);
+  fclose(fp);
+  fprintf(stderr,"### DEEP-TRACE dumped %u bytes (wptr=%u overflow=%d wrapped=%d) -> %s\n",
+          n, wbytes, (int)ovf, (wbytes>RINGSZ)?1:0, path);
+}
 static void dump_trace(Driver *d) {
   uint32_t wptr = d->read32(0x19) & 0x1ff;
   printf("=== TRACE BUFFER: %u rows ===\n", wptr);
@@ -406,7 +426,12 @@ int main(int argc, char *argv[]) {
 
 
   
-  uint32_t cr = single_step ? (8 | 2 | STEP) : (8 | 2);
+  g_l2nc = getenv("L2_NOCACHE") ? (1u<<20) : 0u;
+  g_deeptrace = getenv("TRACE_DEEP") ? (1u<<21) : 0u;
+  if(g_deeptrace) printf("### TRACE_DEEP=1: DRAM control-flow deep trace armed (ctrl bit21, ring @0x18000000)\n"), std::fflush(nullptr);
+  printf("### RTL build-rev = 0x%08x (expect 0x20260727 = deep-trace)\n", d->read32(0x3f)), std::fflush(nullptr);
+  if(g_l2nc) printf("### L2_NOCACHE=1: L2 behaves as no-cache (ctrl bit20 set before go)\n"), std::fflush(nullptr);
+  uint32_t cr = (single_step ? (8 | 2 | STEP) : (8 | 2)) | g_l2nc | g_deeptrace;
   d->write32(4, cr);
 
 
@@ -445,8 +470,29 @@ int main(int argc, char *argv[]) {
   if(xpath2_mode)   { printf("[xc] ARM producer armed (completion direction)\n"); }
 
   FILE* g_trace=nullptr; int g_cdb_count=0; unsigned long g_nlog=0;
+  FILE* g_rt_file=nullptr; unsigned long g_rt_fills=0, g_rt_entries=0, g_rt_rearm=0;
   while(c < max_iters && !done) {
     mon_poll();
+    if(g_deeptrace && (c & 0x3ffff)==0){
+      uint32_t wb=d->read32(0x1c); uint32_t cr4=d->read32(0x04); bool ov=(d->read32(0x26)>>11)&1;
+      fprintf(stderr,"### deep-trace: wptr=%u (%u recs) ovf=%d ctrl=0x%08x bit21=%d\n", wb, wb/8, (int)ov, cr4, (cr4>>21)&1), fflush(stderr);
+    }
+
+    if(getenv("PAUSE_TEST") && g_armed==7){
+      static int g_pev=0, g_pdur=0, g_paused=0; static time_t g_next_pause=0, g_pause_end=0;
+      if(!g_pev){ const char*e=getenv("PAUSE_EVERY"); g_pev=e?atoi(e):10; const char*u=getenv("PAUSE_DUR"); g_pdur=u?atoi(u):2; }
+      time_t now=time(0); uint32_t acr=(8u|2u)|(1u<<17)|g_l2nc;
+      if(!g_next_pause) g_next_pause=now+g_pev;
+      if(!g_paused && now>=g_next_pause){
+        d->write32(4, acr|STEP);   /* HALT (single_step) -- do NOT sleep; loop keeps servicing */
+        g_paused=1; g_pause_end=now+g_pdur;
+        fprintf(stderr,"### HALT %ds (non-blocking; ARM keeps servicing)\n", g_pdur); fflush(stderr);
+      } else if(g_paused && now>=g_pause_end){
+        d->write32(4, acr);        /* RESUME */
+        g_paused=0; g_next_pause=now+g_pev;
+        fprintf(stderr,"### RESUME\n"); fflush(stderr);
+      }
+    }
     if(!g_armed && (c & 0xFFFF)==0 && access("/tmp/ARMFATAL", F_OK)==0){
       g_armed = 1;
       d->write32(4, (8u|2u) | (1u<<17));   /* arm RTL fault-trap: bp_enable = ctrl bit17 */
@@ -483,6 +529,219 @@ int main(int argc, char *argv[]) {
       d->write32(9, 0x0e774158u);            /* bp_pc = array-insert grow-test (idx=gpr6, cap=gpr8 live) */
       d->write32(4, (8u|2u) | (1u<<17));      /* arm bp_enable */
       fprintf(stderr, "### ARMCAP armed: break @0e774158, watch idx(gpr6) vs cap(gpr8)\n");
+    }
+    if(!g_armed && (c & 0xFFFF)==0 && access("/tmp/ARMRT", F_OK)==0){
+      g_armed = 7;
+      const char* rtp = getenv("RT_TRACE_FILE"); if(!rtp) rtp = "/mnt/rttrace/trace.bin";
+      g_rt_file = fopen(rtp, "wb");
+      const char* bpe = getenv("RT_BP_PC"); uint32_t bppc = bpe ? (uint32_t)strtoul(bpe,0,0) : 0x0fafd878u;
+      /* PC+THRESHOLD store watchpoint (be small-int-in-pointer-field BIRTH catch): with the new RTL,
+       * bp_wp_addr(reg10)=the STORE'S PC to watch, and the WP freezes when that store's DATA < bp_wp_val(reg11).
+       * RT_WP_PC unset -> reg10=0xffffffff (no store pc matches => WP off). */
+      const char* wpe = getenv("RT_WP_PC");     uint32_t wppc = wpe ? (uint32_t)strtoul(wpe,0,0) : 0xffffffffu;
+      const char* wte = getenv("RT_WP_THRESH"); uint32_t wpth = wte ? (uint32_t)strtoul(wte,0,0) : 0x01000000u;
+      d->write32(9, bppc);                    /* bp_pc = retire-match freeze fallback (RT_BP_PC; 0 disables) */
+      d->write32(10, wppc);                   /* bp_wp_addr = store-WP PC (RT_WP_PC); 0xffffffff => WP off */
+      d->write32(11, wpth);                   /* bp_wp_val = small-data threshold: freeze if store DATA < this */
+      d->write32(4, (8u|2u) | (1u<<17) | g_l2nc | g_deeptrace);   /* arm bp_enable (+L2_NOCACHE +deep-trace) -> flight recorder */
+      fprintf(stderr, "### ARMRT armed: bp_pc=%08x wp_pc=%08x thresh=%08x (l2nc=%u) -> %s (%s)\n", bppc, wppc, wpth, g_l2nc?1:0, rtp, g_rt_file?"open":"OPEN-FAIL");
+    }
+    /* ARMFAULT: fault-only freeze at bp_pc (ctrl bit19 = bp_fault_only).  Deterministic -- the
+     * pipe + ring freeze ONLY when bp_pc FAULTS, so a HOT bp_pc (0e788bc0, usually a clean load)
+     * doesn't churn on every normal pass.  No wild-deref classifier / re-arm; freeze == the crash. */
+    if(!g_armed && (c & 0xFFFF)==0 && access("/tmp/ARMFAULT", F_OK)==0){
+      g_armed = 8;
+      const char* rtp = getenv("RT_TRACE_FILE"); if(!rtp) rtp = "/mnt/rttrace/trace.bin";
+      g_rt_file = fopen(rtp, "wb");
+      const char* bpe = getenv("RT_BP_PC"); uint32_t bppc = bpe ? (uint32_t)strtoul(bpe,0,0) : 0x0e788bc0u;
+      d->write32(9, bppc);                                  /* bp_pc = the faulting load */
+      d->write32(10, 0xffffffffu);                          /* bp_wp_addr = never-matched: DISABLE the store
+                                                             * watchpoint (else reset-0 bp_wp_addr freezes on
+                                                             * a store of 0 to addr 0 during boot -> r_wp_hit) */
+      d->write32(11, 0x00000001u);                          /* bp_wp_val != wildcard, != 0 */
+      d->write32(4, (8u|2u) | (1u<<17) | (1u<<19));         /* arm bp_enable + bp_fault_only */
+      fprintf(stderr, "### ARMFAULT armed: fault-only freeze bp_pc=%08x (wp disabled) -> %s (%s)\n", bppc, rtp, g_rt_file?"open":"OPEN-FAIL");
+    }
+    if(g_armed==7 && g_rt_file){
+      const uint32_t CR=(8u|2u)|(1u<<17)|g_l2nc|g_deeptrace;
+      d->write32(0x17, 0x800);                /* select retire-trace region (dbg_trace_index[11]=1) */
+      uint32_t wp = d->read32(0x19);
+      uint32_t st26 = d->read32(0x26);        /* global frozen bits: [8]=fault [9]=wp [10]=bp-match */
+      static int g_dbgfrz=0;
+      if(((st26>>8)&0x7u) && g_dbgfrz<4){ fprintf(stderr,"### DBGFRZ 0x19=%08x 0x26=%08x rt=%d flt=%d wp=%d bp=%d\n",wp,st26,(int)((wp>>8)&1),(int)((st26>>8)&1),(int)((st26>>9)&1),(int)((st26>>10)&1)); g_dbgfrz++; fflush(stderr); }
+      if(((wp>>8)&1) || ((st26>>8)&0x7u)){                          /* r_rt_frozen -> ring froze on a fault OR a bp_pc match */
+        /* fault context from the exc-ring (index[10]=1: w0=cause w1=epc w2=badvaddr w3=cycle w4=uop w5=fetched).
+         * KEY: the exc-ring records ONLY t_arch_fault with cause 4/5/6/7/10 (w_exc_we in core.sv); a bp_pc
+         * match does NOT write it.  A re-arm drops bp_enable which RESETS r_exc_wptr to 0.  Therefore, at a
+         * freeze: ewp==0  => no recorded fault since the last re-arm => the freeze IS the bp_pc match (the
+         * SIGSEGV-post @0x880f3284 = the real be crash).  ewp!=0 => a real fault entry (cause 4/5/6/7/10) was
+         * written => read its cause.  In IRIX cause 4/5 (AdEL/AdES) are ROUTINE (the kernel EMULATES misaligned
+         * accesses via the AdEL handler) and cause 10 (RI) is FP-emul -- re-arm past them; only cause 6/7
+         * (a genuine bus error) is fatal. */
+        /* WP-BIRTH: the PC+threshold store watchpoint froze on a store at the producer PC (RT_WP_PC,
+         * e.g. 0f377124) whose DATA < threshold.  dbg_frozen(reg0x26 bits[10:8])={bp,wp,fault};
+         * dbg_wp_data(reg0x27)=the store value (r21).  A small NONZERO value = a small int written where
+         * a heap pointer belongs = THE CORRUPTION BIRTH -> dump (window rooted AT the bad store).  A NULL
+         * (0) or large value at that pc is a legit store -> re-arm past it. */
+        uint32_t frz3 = (d->read32(0x26) >> 8) & 0x7;
+        bool wp_hit   = (frz3 >> 1) & 1u;
+        uint32_t wpdata = wp_hit ? d->read32(0x27) : 0u;
+        bool wp_birth = wp_hit && (wpdata != 0u) && (wpdata < 0x01000000u);
+        d->write32(0x17, 0x400); uint32_t ewp = d->read32(0x19) & 0x1f;
+        uint32_t ee = (ewp - 1) & 0xf; uint32_t ex[6];
+        for(int k=0;k<6;k++){ d->write32(0x17, 0x400u|(ee<<3)|k); ex[k]=d->read32(0x18); }
+        uint32_t cause=ex[0], epc=ex[1], badv=ex[2], fetched=ex[5];
+        /* TWO triggers:
+         * (A) WILD-BADVADDR cause-4 (the primary: roots the window AT the faulting deref).  A cause-4 (AdEL)
+         *     froze the ring.  Routine unaligned-emulation targets the process's REAL data (badv ~0x200000,
+         *     0x0c..0x12M heap/text, 0x7fffxxxx stack) -> re-arm.  A CRASH deref of a corrupt pointer hits a
+         *     WILD addr: tiny (<64K, e.g. crash-6's 0x17) or kernel-range (>=0x80000000 from user).  Stop &
+         *     dump -> the 16K window is rooted at the deref, holding the corrupt value's origin.  epc must be
+         *     userspace (a real user fault, not a kernel-internal AdEL).  RT_WILD_MAX overrides the 0x10000.
+         * (B) bp_pc = kernel exit() entry 0x8814a360: fallback for cause-2 (aligned unmapped) crashes that
+         *     don't freeze the ring.  a0(r4)=sig (sigtramp 0x0fafd878); stop on crash signals (4/10/11), re-arm past normal exits. */
+        bool bpmatch = (ewp==0u);
+        bool bpdump = bpmatch && g_bp_dump;   /* off-golden trigger pc retired -> capture the 32K window ENDING here */
+        uint32_t sig_arg = 0;
+        if(bpmatch){ d->write32(14, 4); sig_arg = d->read32(0xe); }
+        /* WILD = below the lowest valid mapping (0x200000) or kernel-range from user.  cause 4/5 (AdEL/AdES,
+         * misaligned = SIGBUS) freeze the ring UNCONDITIONALLY -> filter them here by badv (catches SIGBUS-face
+         * wild derefs of any magnitude below 0x200000).  cause 2/3 (aligned = SIGSEGV) only reach us when the
+         * NEW bit already gated them to <64KB.  Nothing routine lives below 0x200000. */
+        const char* wm = getenv("RT_WILD_MAX"); uint32_t wild_max = wm ? (uint32_t)strtoul(wm,0,0) : 0x200000u;
+        bool wild_deref = (!bpmatch) && (cause==2u||cause==3u||cause==4u||cause==5u) && (epc < 0x80000000u) && (badv < wild_max || badv >= 0x80000000u);
+        /* cause-10 RI = wild JUMP to garbage (SIGILL face).  The jump lands on a MAPPED data/heap
+         * page (valid addr, garbage decode) -> EPC is the wild target.  be text ~0x0e, libc/rld
+         * ~0x0f (routine FP-emul RIs live there -> re-arm); a wild jump lands in the data/heap/stack
+         * (>=0x10000000) or below text -> stop.  (A jump to a TINY addr faults as cause-2 IFetch, caught above.) */
+        bool wild_jump  = (!bpmatch) && (cause==10u) && (epc < 0x80000000u) && (epc >= 0x10000000u || epc < 0x0c000000u);
+        bool bpkill     = bpmatch && (sig_arg==4u || sig_arg==10u || sig_arg==11u);
+        bool real       = wild_deref || wild_jump || bpkill || (cause==6u) || (cause==7u) || wp_birth || bpdump;
+        if(wp_hit && !wp_birth) real = false;   /* NULL/large store at the producer pc -> re-arm past it */
+        if(!real){
+          g_rt_rearm++;
+          if(bpmatch)
+            fprintf(stderr,"### re-arm #%lu past sigtramp sig=%u\n",(unsigned long)g_rt_rearm,sig_arg), fflush(stderr);
+          else if((g_rt_rearm % 64)==0)
+            fprintf(stderr,"### re-arm #%lu past routine fault cause=%u epc=%08x badv=%08x\n",
+                    (unsigned long)g_rt_rearm, cause, epc, badv), fflush(stderr);
+          d->write32(4, (8u|2u)|g_l2nc); d->write32(4, CR);   /* re-arm (drop+raise bp_enable, keep l2nc): reset+resume */
+        } else {
+          const char* why = bpdump ? "BP-DUMP @off-golden trigger pc" : wp_birth ? "WP-BIRTH (small int stored @ producer pc)" : (wild_deref ? "WILD-DEREF @fault" : (wild_jump ? "WILD-JUMP @RI (SIGILL face)" : (bpkill ? "SIGNAL-KILL @sigtramp" : "BUS ERROR")));
+          if(wp_birth) fprintf(stderr,"### *** WP-BIRTH CAUGHT: producer store DATA=0x%08x (a small int in a pointer field) -- window rooted AT the bad store ***\n", wpdata);
+          if(g_characterize){   /* lightweight: log the crash's VA/sp + re-arm+continue (many samples/boot) */
+            d->write32(14, 29); uint32_t sp = d->read32(0xe);
+            g_rt_fills++;
+            fprintf(stderr,"### CHAR #%lu: %s cause=%u epc=%08x badv=%08x sp=%08x poison_pg=%08x fetched=%08x\n",
+                    (unsigned long)g_rt_fills, why, cause, epc, badv, sp, sp & ~0xfffu, fetched);
+            fflush(stderr);
+            d->write32(4, (8u|2u)|g_l2nc); d->write32(4, CR);   /* re-arm + resume -> catch the next crash */
+          } else {
+          fprintf(stderr,"### FRZ #%lu (REAL, %s sig=%u): ewp=%u exc[cause=%u epc=%08x badvaddr=%08x fetched=%08x]  (%lu re-arms)\n",
+                  (unsigned long)g_rt_fills, why, sig_arg, ewp, cause, epc, badv, fetched, (unsigned long)g_rt_rearm);
+          fprintf(stderr,"### GPRs:"); for(int i=0;i<32;i++){ d->write32(14,i); fprintf(stderr," r%d=%08x",i,d->read32(0xe)); } fprintf(stderr,"\n");
+          /* TLB SHADOW dump: 48 entries x 4 words via dbg_trace_index 0x200|(entry<<3)|word.
+           * w0={r,vpn} w1={asid,pagemask} w2=EntryLo0 w3=EntryLo1.  Compared offline vs the
+           * interp_mips checkpoint TLB (golden_tlb.py) to catch a mistranslation. */
+          fprintf(stderr,"### TLB48:");
+          for(int e=0;e<48;e++){
+            for(int w4=0;w4<4;w4++){ d->write32(0x17, 0x200u|((uint32_t)e<<3)|(uint32_t)w4); fprintf(stderr," %08x", d->read32(0x18)); }
+          }
+          fprintf(stderr,"\n");
+          fflush(stderr);
+          /* STACK DRAM read: does memory actually HOLD the spilled small-int, or did the LOAD
+           * fabricate it?  Translate sp(r29) via the TLB shadow -> PA, read a range of DRAM.
+           * Offline: the crash's ld was `ld rX,off(r29)` -> check DRAM[sp+off] == the value. */
+          {
+            d->write32(14, 29); uint32_t sp = d->read32(0xe);
+            uint32_t vpn2 = (sp >> 13) & 0x7ffffffu, odd = (sp >> 12) & 1u, pfn = 0xffffffffu;
+            for(int e=0;e<48;e++){
+              d->write32(0x17, 0x200u|((uint32_t)e<<3)|0u); uint32_t w0 = d->read32(0x18);
+              if((w0 & 0x7ffffffu) != vpn2) continue;
+              d->write32(0x17, 0x200u|((uint32_t)e<<3)|(odd?3u:2u)); uint32_t lo = d->read32(0x18);
+              if(lo & 0x2u) pfn = (lo>>6)&0xffffffu;   /* v bit set */
+              break;
+            }
+            if(pfn != 0xffffffffu){
+              uint32_t pab = pfn*0x1000u + (sp & 0xfffu);
+              fprintf(stderr,"### STACK DRAM sp=%08x -> pa=%08x:", sp, pab);
+              for(uint32_t off=0; off<0x120u; off+=4){ fprintf(stderr," +%x=%08x", off, rdbe(pab+off)); }
+              fprintf(stderr,"\n");
+              /* CROSS-CHECK (complete history via per-page bitmap): was the poison's physical page
+               * EVER a SCSI DMA (disk->DRAM) target? (page-reuse + stale-L1 hypothesis).  Check the
+               * stack page +- 1 neighbor. */
+              int hitpg = -2;
+              for(int pg = -1; pg <= 1 && hitpg < -1; pg++){
+                uint32_t ppage = (pab & ~0xfffu) + (uint32_t)(pg*0x1000);
+                if(scsi_dma_page_seen(ppage)) hitpg = pg;
+              }
+              if(hitpg >= -1)
+                fprintf(stderr,"### *** POISON-PAGE WAS SCSI-DMA'd (page %+d of stack pa=%08x) -- page-reuse+stale-cache CANDIDATE (of %u total DMA ranges) ***\n",
+                        hitpg, pab, g_scsi_dma_n);
+              else
+                fprintf(stderr,"### poison page %08x + neighbors NEVER SCSI-DMA'd (of %u total ranges) -- DMA-reuse hypothesis RULED OUT for this crash\n",
+                        pab & ~0xfffu, g_scsi_dma_n);
+            } else fprintf(stderr,"### STACK: no valid TLB entry for sp=%08x vpn2=%x\n", sp, vpn2);
+            fflush(stderr);
+          }
+          /* walk the 32768-entry pre-fault window (oldest..newest) via auto-increment:
+           * read a row's 6 words, then pulse `step` to advance the internal read ptr. */
+          for(int i=0;i<32768;i++){
+            uint32_t w[6];
+            for(int k=0;k<6;k++){ d->write32(0x17, 0x800u|k); w[k]=d->read32(0x18); }
+            struct __attribute__((packed)) { uint64_t pc; uint32_t inst; uint8_t valid,reg; uint64_t val; } rec;
+            rec.pc=((uint64_t)w[1]<<32)|w[0]; rec.inst=w[2];
+            rec.valid=(uint8_t)((w[5]>>5)&1); rec.reg=(uint8_t)(w[5]&0x1f); rec.val=((uint64_t)w[4]<<32)|w[3];
+            fwrite(&rec,sizeof(rec),1,g_rt_file); g_rt_entries++;
+            d->write32(4, CR|(1u<<30)); d->write32(4, CR);   /* step: advance read ptr to next entry */
+          }
+          fflush(g_rt_file); g_rt_fills++;
+          fprintf(stderr,"### REAL CRASH (%s) -- 16K window dumped (%lu entries), STOPPING.\n",why,(unsigned long)g_rt_entries);
+          if(g_deeptrace) dump_dram_trace(d);
+          done = true;
+          }   /* end !g_characterize (full dump) */
+        }
+      }
+    }
+    if(g_armed==8){
+      /* fault-only: r_bp_hit (status bit10) latches ONLY on the fault at bp_pc.  Freeze == crash. */
+      const uint32_t CR = (8u|2u)|(1u<<17)|(1u<<19);
+      uint32_t st = d->read32(0x26);
+      uint32_t flt_frz = (st>>8)&1, wp_frz = (st>>9)&1, bp_frz = (st>>10)&1;
+      static int g_reported = 0;
+      if((flt_frz||wp_frz) && !bp_frz && !g_reported){
+        g_reported = 1;
+        fprintf(stderr,"### UNEXPECTED FREEZE (not bp): fault=%u wp=%u  cause=%u epc=%08x badv=%08x pc=%08x\n",
+                flt_frz, wp_frz, st&31, d->read32(0xb), d->read32(0xc), d->read32(7));
+        fflush(stderr);
+      }
+      if(bp_frz){
+        uint32_t cz=st&31, epc=d->read32(0xb), badv=d->read32(0xc), lastpc=d->read32(7);
+        fprintf(stderr,"### FAULT-FREEZE @bp_pc: cause=%u epc=%08x badvaddr=%08x lastpc=%08x\n", cz, epc, badv, lastpc);
+        fprintf(stderr,"### GPRs:"); for(int i=0;i<32;i++){ d->write32(14,i); fprintf(stderr," r%d=%08x",i,d->read32(0xe)); } fprintf(stderr,"\n");
+        /* TLB SHADOW: 48 entries x 4 words via dbg_trace_index 0x200|(entry<<3)|word.
+         * w0={r,vpn} w1={asid,pagemask} w2=EntryLo0 w3=EntryLo1 -- diff offline vs golden_tlb.py. */
+        fprintf(stderr,"### TLB48:");
+        for(int e=0;e<48;e++){
+          for(int w4=0;w4<4;w4++){ d->write32(0x17, 0x200u|((uint32_t)e<<3)|(uint32_t)w4); fprintf(stderr," %08x", d->read32(0x18)); }
+        }
+        fprintf(stderr,"\n"); fflush(stderr);
+        /* dump the 32768-entry pre-fault window (oldest..newest) via step auto-increment */
+        if(g_rt_file){
+          for(int i=0;i<32768;i++){
+            uint32_t w[6];
+            for(int k=0;k<6;k++){ d->write32(0x17, 0x800u|k); w[k]=d->read32(0x18); }
+            struct __attribute__((packed)) { uint64_t pc; uint32_t inst; uint8_t valid,reg; uint64_t val; } rec;
+            rec.pc=((uint64_t)w[1]<<32)|w[0]; rec.inst=w[2];
+            rec.valid=(uint8_t)((w[5]>>5)&1); rec.reg=(uint8_t)(w[5]&0x1f); rec.val=((uint64_t)w[4]<<32)|w[3];
+            fwrite(&rec,sizeof(rec),1,g_rt_file); g_rt_entries++;
+            d->write32(4, CR|(1u<<30)); d->write32(4, CR);
+          }
+          fflush(g_rt_file);
+        }
+        fprintf(stderr,"### REAL CRASH (fault-only @bp_pc) -- 16K window dumped (%lu entries), STOPPING.\n",(unsigned long)g_rt_entries);
+        done = true;
+      }
     }
     if(g_armed==5){
       const uint32_t CR = (8u|2u)|(1u<<17);
