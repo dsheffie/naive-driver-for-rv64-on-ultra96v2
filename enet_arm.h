@@ -35,6 +35,7 @@ enum {
   ENET_R_TX_REQ_SEQ = 0x39, ENET_R_TX_NBDP = 0x3C,
   ENET_R_RX_ARM_SEQ = 0x3D, ENET_R_RX_NBDP = 0x3E,
   ENET_W_TX_RSP_SEQ = 0x12, ENET_W_RX_RSP_SEQ = 0x13, ENET_W_RX_CRBDP = 0x14,
+  ENET_W_TX_CRBDP = 0x15,
 };
 
 /* guest PA -> DRAM-window offset (the SAME fold as scsi_fpga_map / henry_tb fpga_map
@@ -122,7 +123,14 @@ static inline bool enet_arm_poll(Driver *d, enet_tap *tap, uint8_t *dram) {
         }
       }
     }
-    uint32_t txlen = enet_tx_run(enet_arm_mem, dram, nbdp, tap->fd);
+    uint32_t tx_end = nbdp;
+    uint32_t txlen = enet_tx_run(enet_arm_mem, dram, nbdp, tap->fd, &tx_end);
+    /* Publish the TX CRBDP BEFORE echoing the doorbell: the guest's completion handler
+     * runs off the TX interrupt that the echo raises, and it needs a valid terminator
+     * the moment it walks.  Unpublished (== 0) the guest computed 0xa0000000, which can
+     * never equal a descriptor pointer, so its loop overran the ring and faulted in
+     * m_freem's chain walk (PC 0x88058338). */
+    d->write32(ENET_W_TX_CRBDP, tx_end);
     if(g_enet_dbg) {
       fprintf(stderr, "[enetdbg] TX seq=%u nbdp=0x%08x -> len=%u\n", tx_seq, nbdp, txlen);
     }

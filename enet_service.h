@@ -74,23 +74,28 @@ struct enet_tap {
 /* Sentinel: the chain was torn / still being built.  The CALLER must leave the TX
  * doorbell UNCONSUMED so the walk is retried, otherwise the packet is dropped. */
 #define ENET_TX_INCOMPLETE 0xffffffffu
-static inline uint32_t enet_tx_run(scsi_mem_fn mem, void *ctx, uint32_t nbdp, int tap_fd) {
+/* end_nbdp (optional) receives the descriptor address the walk stopped AT -- i.e. the
+ * `next` of the last descriptor consumed.  The guest's TX-completion handler reads that
+ * value back as the TX CRBDP (HPC3 0x1a000) and uses it as the terminator for its
+ * descriptor walk; leaving it unpublished is what let the walk run off the ring. */
+static inline uint32_t enet_tx_run(scsi_mem_fn mem, void *ctx, uint32_t nbdp, int tap_fd,
+                                   uint32_t *end_nbdp = nullptr) {
     static const bool g_txwalk = getenv("TXWALK") != nullptr;
     uint8_t  frame[ENET_FRAME_MAX];
     uint8_t *touched[64];
     uint32_t touched_bc[64];
-    uint32_t len = 0;
-    int ndesc = 0;
-    bool complete = false;
+    uint32_t len = 0, total = 0;
+    int ndesc = 0, npkt = 0;
 
-    /* Walk the chain WITHOUT modifying it.  A packet is complete only when EOXP is
-     * seen: EOXP ends a PACKET, EOX ends the CHAIN.  A descriptor carrying a bare
-     * EOX is a STALE bit from that ring slot's previous use -- real HPC3 is a
-     * continuously-running engine and the guest appends to the chain live (clearing
-     * EOX on the old tail), so a polled walker CAN observe a half-built chain.
-     * Committing one of those is what corrupted IRIX: we marked ETXD on descriptors
-     * the guest had not finished with, it freed those mbufs, and the next chain walk
-     * chased a freed pointer -> TLBMISS in m_freem. */
+    /* HPC3 emits ONE FRAME PER EOXP and keeps walking to the next descriptor until
+     * EOX ends the chain.  A single chain can therefore hold SEVERAL packets -- which
+     * is exactly what happens once the application writes more than one MSS at a time
+     * (measured threshold: -l 1024 clean, -l 2048 fatal, MSS 1460 in between).
+     * Both previous versions got this wrong:
+     *   - stopping only at EOX  -> concatenated several packets into one giant frame;
+     *   - stopping at the first EOXP -> emitted packet 1 and silently abandoned the
+     *     rest, never marking their ETXD, so the guest's TX queue never drained.
+     * Emit at every EOXP, mark that packet's descriptors, then continue. */
     for(int guard = 0; guard < 64; guard++) {
         uint8_t *d = mem(ctx, nbdp, 12);
         if(!d) { break; }
@@ -103,38 +108,42 @@ static inline uint32_t enet_tx_run(scsi_mem_fn mem, void *ctx, uint32_t nbdp, in
             uint8_t *b = mem(ctx, bp, cnt);
             if(b) { memcpy(frame + len, b, cnt); len += cnt; }
         }
-        touched[ndesc]    = d;
-        touched_bc[ndesc] = bc;
-        ndesc++;
-        if(bc & HPC3_BC_EOXP) { complete = true; break; }   /* end of PACKET */
-        if(bc & HPC3_BC_EOX)  { break; }                    /* chain end, no EOXP */
+        touched[ndesc] = d; touched_bc[ndesc] = bc; ndesc++;
+
+        if(bc & HPC3_BC_EOXP) {                    /* end of THIS packet -> emit it */
+            if(tap_fd >= 0 && len >= 14) {
+                ssize_t n = ::write(tap_fd, frame, len); (void)n;
+            }
+            for(int i = 0; i < ndesc; i++) {
+                enet_put_be32(touched[i] + 4, touched_bc[i] | HPC3_BC_ETXD);
+            }
+            if(g_txwalk) {
+                fprintf(stderr, "[txwalk]   pkt%d ndesc=%d len=%u\n", npkt, ndesc, len);
+            }
+            total += len; npkt++; len = 0; ndesc = 0;
+        }
+        if(end_nbdp) { *end_nbdp = next; }         /* where the engine would go next */
+        if(bc & HPC3_BC_EOX) {                     /* end of the CHAIN */
+            if(ndesc) {                            /* trailing run with no EOXP */
+                if(tap_fd >= 0 && len >= 14) {
+                    ssize_t n = ::write(tap_fd, frame, len); (void)n;
+                }
+                for(int i = 0; i < ndesc; i++) {
+                    enet_put_be32(touched[i] + 4, touched_bc[i] | HPC3_BC_ETXD);
+                }
+                total += len; npkt++;
+            }
+            break;
+        }
         nbdp = next;
     }
-
-    if(!complete) {
-        /* Torn / still-being-built chain.  Touch NOTHING and let the next poll retry
-         * -- same self-healing contract enet_rx_inject uses for a not-yet-armed
-         * descriptor.  Returning 0 also means no frame is emitted. */
-        if(g_txwalk) {
-            fprintf(stderr, "[txwalk] INCOMPLETE chain: ndesc=%d len=%u -- deferred, nothing marked\n",
-                    ndesc, len);
-        }
-        return ENET_TX_INCOMPLETE;
-    }
-
-    /* Complete packet: emit it FIRST, then mark the descriptors transmitted. */
-    if(tap_fd >= 0 && len >= 14) {
-        ssize_t n = ::write(tap_fd, frame, len);
-        (void)n;
-    }
-    for(int i = 0; i < ndesc; i++) {
-        enet_put_be32(touched[i] + 4, touched_bc[i] | HPC3_BC_ETXD);
-    }
     if(g_txwalk) {
-        fprintf(stderr, "[txwalk] WALK ndesc=%d complete=1 total_len=%u\n", ndesc, len);
+        fprintf(stderr, "[txwalk] WALK packets=%d total_len=%u%s\n", npkt, total,
+                (npkt > 1) ? "  <<< MULTI-PACKET CHAIN" : "");
     }
-    return len;
+    return total;
 }
+
 
 
 /* ---- RX: deposit one inbound frame into the guest RX ring.
@@ -160,6 +169,48 @@ static inline bool enet_rx_inject(scsi_mem_fn mem, void *ctx, uint32_t &nbdp,
     /* layout the driver expects: [2 pad][ethernet frame][1 status] */
     uint32_t written = 2 + flen + 1;
     if(written > bufsz) { written = bufsz; }             /* clamp a giant frame to the buffer */
+    /* RXCHK: direct evidence for the recycled-descriptor suspicion.
+     * We only consult ROWN before scribbling `written` bytes at `bp`.  If the guest
+     * sets ROWN but has not yet updated BP (a torn re-arm -- the RX analogue of the
+     * stale bare EOX proven on TX), we overwrite a buffer it may still own, landing
+     * on whatever now occupies those pages including mbuf headers.  Flag two things:
+     *   SAME-BP : this descriptor was re-armed with the SAME buffer pointer as last
+     *             time -- the guest did not hand us a fresh buffer.
+     *   REUSE   : this bp was injected into by a DIFFERENT descriptor recently, i.e.
+     *             two ring slots point at one buffer. */
+    {
+        static const bool g_rxchk = getenv("RXCHK") != nullptr;
+        if(g_rxchk) {
+            static uint32_t last_bp[64];       /* keyed by descriptor addr (hashed) */
+            static uint32_t recent_bp[32];
+            static uint32_t recent_dsc[32];
+            static unsigned recent_i = 0;
+            static uint64_t n_same = 0, n_reuse = 0, n_inj = 0;
+            unsigned k = (nbdp >> 4) & 63;
+            n_inj++;
+            if(last_bp[k] == bp && bp != 0) {
+                n_same++;
+                fprintf(stderr, "[rxchk] SAME-BP desc=0x%08x bp=0x%08x len=%u  (#%llu of %llu)\n",
+                        nbdp, bp, written, (unsigned long long)n_same, (unsigned long long)n_inj);
+            }
+            for(unsigned j = 0; j < 32; j++) {
+                if(recent_bp[j] == bp && recent_dsc[j] != nbdp && bp != 0) {
+                    n_reuse++;
+                    fprintf(stderr, "[rxchk] REUSE   bp=0x%08x now desc=0x%08x was desc=0x%08x  (#%llu of %llu)\n",
+                            bp, nbdp, recent_dsc[j], (unsigned long long)n_reuse, (unsigned long long)n_inj);
+                    break;
+                }
+            }
+            last_bp[k] = bp;
+            recent_bp[recent_i] = bp; recent_dsc[recent_i] = nbdp;
+            recent_i = (recent_i + 1) & 31;
+            if((n_inj % 2000) == 0) {
+                fprintf(stderr, "[rxchk] injections=%llu same_bp=%llu reuse=%llu\n",
+                        (unsigned long long)n_inj, (unsigned long long)n_same,
+                        (unsigned long long)n_reuse);
+            }
+        }
+    }
     uint8_t *b = mem(ctx, bp, written);
     if(!b) { return false; }
     b[0] = 0; b[1] = 0;                                  /* 2-byte alignment pad */
