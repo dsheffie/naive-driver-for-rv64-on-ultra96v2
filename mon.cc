@@ -94,7 +94,7 @@ void mon_console_out(int c) {
 }
 
 static const char *g_help =
-  "monitor: s(tate) pc epc regs r<N> trace[N] l2trace[N] arm disarm exc head reset halt go step[N] ret perf scsi help  c/empty=console\r\n";
+  "monitor: s(tate) pc epc regs r<N> trace[N] l2trace[N] arm disarm exc head reset halt go step[N] ret perf scsi diskstat help  c/empty=console\r\n";
 
 static void mon_cmd(char *line) {
   Driver *d = g_d;
@@ -113,6 +113,25 @@ static void mon_cmd(char *line) {
   else if(!strncmp(line, "diskwb", 6)) {
     g_scsi_disk.flush();
     snprintf(out, sizeof(out), "flushed model disk\r\n");
+    mon_send(out);
+  }
+  else if(!strncmp(line, "diskstat", 8)) {
+    /* disk traffic + overlay growth.  Writes never touch the image (COW only),
+     * so ovl_kb is host RAM the model will never give back -- watch it on a
+     * long soak. */
+    scsi_disk &d = g_scsi_disk;
+    uint64_t ovl = (uint64_t)d.overlay_size();
+    uint64_t ovl_kb = (ovl * (512 + 64)) >> 10;   /* payload + rough map-node overhead */
+    snprintf(out, sizeof(out),
+	     "disk rd %llu blk (%llu MB)  ovl-hit %llu  img %llu  zero %llu\r\n"
+	     "     wr %llu blk (%llu MB)  new-lba %llu\r\n"
+	     "     overlay %llu lbas (~%llu KB host RAM)\r\n",
+	     (unsigned long long)d.n_rd, (unsigned long long)(d.n_rd / 2048),
+	     (unsigned long long)d.n_rd_overlay, (unsigned long long)d.n_rd_image,
+	     (unsigned long long)d.n_rd_zero,
+	     (unsigned long long)d.n_wr, (unsigned long long)(d.n_wr / 2048),
+	     (unsigned long long)d.n_wr_new,
+	     (unsigned long long)ovl, (unsigned long long)ovl_kb);
     mon_send(out);
   }
   else if(!strncmp(line, "overlay", 6)) {

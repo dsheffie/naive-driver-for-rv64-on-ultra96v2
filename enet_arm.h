@@ -72,11 +72,79 @@ static inline bool enet_arm_poll(Driver *d, enet_tap *tap, uint8_t *dram) {
   bool did_work = false;
 
   /* ---- TX doorbell: assemble the frame from the {BP,BC,DP} chain -> tap ---- */
+  /* ENETDBG: split guest-side (doorbell never rings) from ARM-side (rings but the
+   * chain walk yields nothing).  Read-once getenv -- this is a hot poll loop. */
+  static const bool g_enet_dbg = getenv("ENETDBG") != nullptr;
+  static uint32_t tx_defer = 0;                 /* consecutive torn-chain deferrals */
   uint32_t tx_seq = d->read32(ENET_R_TX_REQ_SEQ);
+  if(g_enet_dbg) {
+    static uint64_t polls = 0;
+    if((++polls % 2000000ull) == 0) {
+      fprintf(stderr, "[enetdbg] poll=%llu tx_req_seq=%u last=%u rx_nbdp=0x%08x\n",
+              (unsigned long long)polls, tx_seq, last_tx_seq, rx_nbdp);
+    }
+  }
   if(tx_seq != last_tx_seq) {
-    last_tx_seq = tx_seq;
     uint32_t nbdp = d->read32(ENET_R_TX_NBDP);
-    enet_tx_run(enet_arm_mem, dram, nbdp, tap->fd);
+    /* Snapshot the chain BEFORE the walk: enet_tx_run OR-writes ETXD into every
+     * descriptor it touches, so a post-walk read cannot show the guest's value. */
+    if(g_enet_dbg) {
+      /* Linear dump of the whole 16-entry TX ring (stride 0x80), ignoring EOX, so
+       * we can see whether the zeroed cntinfo is one descriptor or all of them. */
+      for(int k = 0; k < 16; k++) {
+        uint32_t a = nbdp + (uint32_t)(k * 0x80);
+        uint8_t *dsc = enet_arm_mem(dram, a, 16);
+        if(!dsc) {
+          fprintf(stderr, "[enetdbg]   ring[%2d] @0x%08x -> NULL\n", k, a);
+          break;
+        }
+        fprintf(stderr, "[enetdbg]   ring[%2d] @0x%08x bp=0x%08x cntinfo=0x%08x next=0x%08x w3=0x%08x\n",
+                k, a, hdma_be32(dsc + 0), hdma_be32(dsc + 4), hdma_be32(dsc + 8), hdma_be32(dsc + 12));
+      }
+    }
+    /* Race check: does the guest's cntinfo show up LATE?  If the uncached tx_ctrl
+     * store (the doorbell) can overtake the descriptor writeback, the value will
+     * appear a few ms after the kick.  Poll before walking; report how long. */
+    if(g_enet_dbg) {
+      uint8_t *dsc = enet_arm_mem(dram, nbdp, 12);
+      if(dsc) {
+        uint32_t first = hdma_be32(dsc + 4);
+        if(!(first & HPC3_BC_COUNT)) {
+          int ms = 0;
+          uint32_t v = first;
+          for(; ms < 300; ms++) {
+            usleep(1000);
+            v = hdma_be32(dsc + 4);
+            if(v != first) { break; }
+          }
+          fprintf(stderr, "[enetdbg]   wait: cntinfo 0x%08x -> 0x%08x after %d ms%s\n",
+                  first, v, ms, (ms >= 300) ? " (TIMEOUT: never arrived)" : "");
+        }
+      }
+    }
+    uint32_t txlen = enet_tx_run(enet_arm_mem, dram, nbdp, tap->fd);
+    if(g_enet_dbg) {
+      fprintf(stderr, "[enetdbg] TX seq=%u nbdp=0x%08x -> len=%u\n", tx_seq, nbdp, txlen);
+    }
+    /* Settle window, NOT an indefinite hold.  A chain the guest is mid-write finishes
+     * within a few polls; but some chains legitimately end on a bare EOX with no EOXP
+     * (52 of 15750 observed), and holding those for long blocks TX and throttles the
+     * whole bridge -- 20000 cost ~5x throughput.  A short window keeps the race fix
+     * while letting a genuine EOX-only chain through almost immediately. */
+    if(txlen == ENET_TX_INCOMPLETE && tx_defer < 16) {
+      /* Torn chain: do NOT consume the doorbell and do NOT echo -- the shim keeps TX
+       * ACTIVE and we re-walk on the next poll, once the guest has finished writing
+       * the EOXP terminator.  Bounded so a genuinely malformed chain cannot wedge TX. */
+      tx_defer++;
+      /* We DID work (walked the chain); say so, or the caller's adaptive backoff
+       * ramps to ~1 ms/iter and starves the bridge -- the same poll-rate starvation
+       * that caused 82.9% packet loss in July.  Staying hot also means we re-walk
+       * almost immediately, which is the whole point of deferring. */
+      did_work = true;
+      return did_work;
+    }
+    tx_defer = 0;
+    last_tx_seq = tx_seq;
     __sync_synchronize();
     d->write32(ENET_W_TX_RSP_SEQ, tx_seq);        /* echo -> shim clears ACTIVE + TX IRQ */
     did_work = true;

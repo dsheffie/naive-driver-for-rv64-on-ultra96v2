@@ -163,6 +163,31 @@ static bool           g_tio_saved = false;
 static void restore_tty() {
   if(g_tio_saved) { tcsetattr(0, TCSANOW, &g_saved_tio); g_tio_saved = false; }
 }
+/* Ctrl-C confirmation.  An accidental Ctrl-C used to kill a run outright; it now
+ * arms a prompt and the NEXT keystroke answers it.
+ *
+ * The prompt deliberately does NOT block.  The poll slot that calls the pump is
+ * the same one that services the SCSI and ENET mailboxes (scsi_arm_poll /
+ * enet_arm_poll, a few lines below the pump call), so blocking on the answer
+ * would stall the disk and the tap bridge for as long as the operator dithers.
+ * Instead the confirm is a STATE: keep looping, keep servicing, and merely route
+ * stdin to the answer instead of to the guest Rx FIFO until it resolves.  That
+ * is also why there is nothing to synchronise -- the pump is only ever called
+ * from the run loop, so it cannot race the prompt. */
+static volatile sig_atomic_t g_sigint_pending = 0;
+static volatile sig_atomic_t g_confirm_active = 0;
+
+static void confirm_key(unsigned char ch) {
+  if(ch == 'y' || ch == 'Y') {
+    fprintf(stderr, "y\n");
+    done = true;
+  }
+  else {
+    fprintf(stderr, "n (resuming)\n");
+  }
+  g_confirm_active = 0;
+}
+
 static inline void pump_stdin_to_rx() {
   static bool init = false;
   if(!init) {
@@ -177,12 +202,43 @@ static inline void pump_stdin_to_rx() {
       tcsetattr(0, TCSANOW, &raw);
     }
   }
+  /* Raise the prompt on the first SIGINT.  tcflush drops anything typed BEFORE
+   * the Ctrl-C so a stale keystroke already sitting in the tty queue cannot
+   * silently answer it.  c_oflag is untouched above so ONLCR is still on, which
+   * is why a bare \n below lands as CRLF. */
+  if(g_sigint_pending && !g_confirm_active) {
+    g_sigint_pending = 0;
+    g_confirm_active = 1;
+    tcflush(0, TCIFLUSH);
+    fprintf(stderr, "\n[mips-axi] really quit? [y/N] ");
+  }
   unsigned char ch;
-  while(read(0, &ch, 1) == 1) scc_rx_push_byte(ch);
+  while(read(0, &ch, 1) == 1) {
+    if(g_confirm_active) {
+      confirm_key(ch);            /* answers the prompt; never reaches the guest */
+    }
+    else {
+      scc_rx_push_byte(ch);
+    }
+  }
 }
 
 void sigintHandler(int id) {
-  done = true;
+  /* Not a TTY -- piped or redirected, e.g. test.py's x100 stress loop.  There is
+   * nobody to prompt, so keep the old kill-the-run behaviour or the script would
+   * hang forever on an answer that cannot come.  g_tio_saved is set by the first
+   * pump call, so a SIGINT arriving before that also takes this path, which is
+   * exactly the pre-change behaviour. */
+  if(!g_tio_saved) {
+    done = true;
+    return;
+  }
+  /* A second Ctrl-C while the prompt is up means it was not an accident. */
+  if(g_confirm_active) {
+    done = true;
+    return;
+  }
+  g_sigint_pending = 1;
 }
 
 uint32_t loadelf(const char* fn, uint8_t *mem, bool sgi_mode);
@@ -199,7 +255,9 @@ bool cmdline(int argc,
 	     std::string &arcs_image,
 	     std::string &start_pc,
 	     std::string &cimg_name,
-	     std::string &disk_name);
+	     std::string &disk_name,
+	     std::string &rom_image,
+	     std::string &rom_pa);
 
 // Silicon checkpoint resume: replicate henry_tb's fpga_map so cimg pages land in DRAM
 // exactly where the core (via the AXI master's IP22 fold) will read them.
@@ -247,6 +305,96 @@ static void dump_dram_trace(Driver* d) {
   fprintf(stderr,"### DEEP-TRACE dumped %u bytes (wptr=%u overflow=%d wrapped=%d) -> %s\n",
           n, wbytes, (int)ovf, (wbytes>RINGSZ)?1:0, path);
 }
+/* Rich retire-trace ring (ENABLE_PC_TRACE in core.sv).  32768 slots x 4 words + gap:
+ *   write32(0x17, (word<<15)|(pair<<1)|bank) -> read32(0x18)
+ *   w0=pc  w1=target_pc (RESOLVED)  w2=data (LOADED VALUE for a load)
+ *   w3={flags,ldst[4:0],opcode[7:0]}  flags: b0 faulted, b1 in_delay_slot,
+ *       b2 is_indirect, b3 is_br, b4 take_br, b5 valid_dst, b6 is_store
+ * read32(0x19) = {frozen@15, ptr[13:0]@14:1, 0} -- a LINEAR slot number, so
+ * frozen=(s>>15)&1 and wptr=s&0x7fff.  This was {frozen@8,[7:0]} when the ring was
+ * 256 deep; the widening to 32K moved the frozen bit and a stale decode here made a
+ * frozen ring look like a live one stuck at 38, and spuriously "captured" the FSBL.
+ * Frozen on a retired indirect whose target is 0 or BTB_POISON_PC.  Dumped
+ * OLDEST->NEWEST; the odd bank's all-ones filler rows are skipped.
+ *
+ * take_br is the key column: it is the RESOLVED branch direction, so a guard
+ * `beqz` that failed to branch is directly visible. */
+/* Ring geometry: LG_RTRACE_ENTRIES=15 -> 32768 slots, held as 16384 PAIRS across
+ * two banks (even/odd), because a single array with two write ports will not infer
+ * as BRAM.  Index map (see core.sv / core_l1d_l1i.sv):
+ *   [19]=L2 ring  [18]=gap word  [17:15]=word (0-3 record, 4-7 GHR)
+ *   [14:1]=pair row  [0]=bank
+ * Status reg 0x19 = {frozen@15, ptr[13:0]@14:1, 1'b0}, i.e. a LINEAR slot number. */
+#define RT_SLOTS 2048u   /* 2K ring: measured evidence window is ~20 retires */
+static void dump_pctrace(Driver *d) {
+  uint32_t st = d->read32(0x19);
+  uint32_t frozen = (st >> 15) & 1u;
+  uint32_t wptr = st & 0x7fffu;                 /* linear next slot = pair*2 */
+  fprintf(stderr, "### RTRACE %s wptr=%u of %u ===\n",
+          frozen ? "FROZEN" : "RUNNING(!)", wptr, RT_SLOTS);
+  fprintf(stderr, "###  idx      pc    target      data  op  ldst flags(f,ds,ind,br,tk,vd,st) pred  pht  gap exec pdst srcA(p/a)\n");
+  for(uint32_t i = 0; i < RT_SLOTS; i++) {
+    uint32_t e = (wptr + i) & (RT_SLOTS - 1u);  /* oldest -> newest */
+    uint32_t pair = e >> 1, bank = e & 1u;
+    uint32_t w[4], gap, exec, pdst, srcA_ptr, srcA_arch;
+    for(uint32_t k = 0; k < 4; k++) {
+      d->write32(0x17, (k << 15) | (pair << 1) | bank);
+      w[k] = d->read32(0x18);
+    }
+    /* all-ones is the filler written into the odd bank on a single-retire cycle */
+    if(w[0] == 0xffffffffu && (w[3] & 0xff) == 0xffu) { continue; }
+    /* one word carries both: {16'd0, exec_cycle[7:0], gap[7:0]}.  exec_cycle is the
+     * low 8 bits of the free-running counter stamped when the uop COMPLETED (for a
+     * load, when its memory response landed), so a consumer whose exec stamp is <=
+     * its producer's executed BEFORE the data was available -- which `gap` alone
+     * cannot distinguish from a consumer that simply never had to wait. */
+    /* 216b record = 7 words; word select is {index[18], index[16:15]} so word w
+     * lives at index ((w & 3) << 15) | ((w >> 2) << 18).  Words 4/5 carry the new
+     * rename-check fields:
+     *   w4 = {srcA_arch[1:0], srcA_ptr[6:0], pdst[6:0], exec[7:0], gap[7:0]}
+     *   w5 = {..., srcA_arch[4:2]}
+     * srcA_ptr vs the producer's pdst is the whole point: a mismatch means the
+     * consumer was pointed at the WRONG physical register (rename/RAT bug) rather
+     * than reading the right one and getting stale data (delivery/bypass bug). */
+    d->write32(0x17, (1u << 18) | (pair << 1) | bank);      /* word 4 */
+    uint32_t gw = d->read32(0x18);
+    d->write32(0x17, (1u << 15) | (1u << 18) | (pair << 1) | bank);  /* word 5 */
+    uint32_t gw5 = d->read32(0x18);
+    gap      = gw & 0xffu;                      /* saturating cycles since prev retire */
+    exec     = (gw >> 8) & 0xffu;               /* completion-cycle stamp (mod 256)    */
+    pdst     = (gw >> 16) & 0x7fu;              /* physical dest written by this uop   */
+    srcA_ptr = (gw >> 23) & 0x7fu;              /* renamed physical srcA it reads      */
+    srcA_arch= ((gw >> 30) & 0x3u) | ((gw5 & 0x7u) << 2);
+    uint32_t fl = w[3];
+    fprintf(stderr, "### RT %5u: %08x %08x %08x  %02x  %2u  %u%u%u%u%u%u%u    %u %4u %4u %4u %4u %4u/r%-2u\n",
+            i, w[0], w[1], w[2], fl & 0xff, (fl >> 8) & 0x1f,
+            (fl>>13)&1, (fl>>14)&1, (fl>>15)&1, (fl>>16)&1,
+            (fl>>17)&1, (fl>>18)&1, (fl>>19)&1,
+            (fl>>20)&1, (fl>>21)&0x7ff, gap, exec, pdst, srcA_ptr, srcA_arch);
+  }
+  /* Global history, read from the free word slots on the same debug port:
+   * index (4<<8)=arch[31:0] (5<<8)=arch[63:32] (6<<8)=spec[31:0] (7<<8)=spec[63:32].
+   * ARCH is the RETIRED history; SPEC is what the PHT is indexed with.  If they
+   * disagree beyond the few branches in flight, speculative history was not
+   * restored after a squash and later predictions indexed the wrong PHT entry. */
+  {
+    uint32_t h[4];
+    for(uint32_t k = 0; k < 4; k++) {
+      d->write32(0x17, (4 + k) << 15);
+      h[k] = d->read32(0x18);
+    }
+    /* SPEC legitimately runs AHEAD of ARCH -- spec updates at predict time, arch
+     * at retire -- so they differ by the branches in flight and an inequality here
+     * is NORMAL, not a fault.  The meaningful question is whether spec RECONVERGES
+     * to arch after a squash (l1i.sv: n_spec_gbl_hist = n_arch_gbl_hist), which is
+     * read by comparing spec against arch shifted, not by equality. */
+    fprintf(stderr, "### GHR arch=%08x%08x spec=%08x%08x  (spec runs ahead; inequality is expected)\n",
+            h[1], h[0], h[3], h[2]);
+  }
+  fprintf(stderr, "### RTRACE END ===\n");
+  fflush(stderr);
+}
+
 static void dump_trace(Driver *d) {
   uint32_t wptr = d->read32(0x19) & 0x1ff;
   printf("=== TRACE BUFFER: %u rows ===\n", wptr);
@@ -274,12 +422,13 @@ int main(int argc, char *argv[]) {
   void *vaddr = nullptr;
   std::string chpt_name;
   std::string arcs_image;
+  std::string rom_image, rom_pa_s;
   std::string start_pc;
   std::string cimg_name, disk_name;
   rvstatus rs(0);
   /* --- SCSI disk service (PS side) --- */
 
-  if(not(cmdline(argc, argv, initialize, silent, chpt_name, max_fetches, max_iters, sgi_mode, single_step, arcs_image, start_pc, cimg_name, disk_name))) {
+  if(not(cmdline(argc, argv, initialize, silent, chpt_name, max_fetches, max_iters, sgi_mode, single_step, arcs_image, start_pc, cimg_name, disk_name, rom_image, rom_pa_s))) {
     return -1;
   }
 
@@ -388,6 +537,50 @@ int main(int argc, char *argv[]) {
     std::cout << "patched FSBL kentry slot @0x1fc00008 (dram 0x10C00008) = 0x" << std::hex << pc << std::dec << "\n";
     
   }
+
+  /* --rom: preload a filesystem image into DRAM for the hcart block device.
+   * hcart serves blocks with plain CPU memcpy out of this window -- there is NO
+   * DMA anywhere in the path.  That is the point: the 2026-09-02 ring capture
+   * showed the faulting `jr t9` read exactly the physreg its producer wrote, and
+   * that producer was a load which returned ZERO -- so rename/wakeup is
+   * exonerated and the bug is on the data path.  Serving the rootfs without DMA
+   * separates "device DMA vs the core's own memory path".
+   *
+   * Placement: the sgi_mode fold maps MIPS PA 0x08000000-0x17ffffff to DRAM
+   * (pa & 0x0fffffff), so the default PA 0x0c000000 lands at DRAM 0x0c000000 --
+   * above the 64 MB the kernel is told about, and clear of the deep-trace ring
+   * at 0x18000000.  No new FSBL or MEMCFG0 is required. */
+  if(not(rom_image.empty())) {
+    uint64_t rom_pa = strtoull(rom_pa_s.c_str(), nullptr, 0);
+    struct stat rst;
+    int rfd = open(rom_image.c_str(), O_RDONLY);
+    if(rfd < 0) {
+      std::cerr << "could not open rom image " << rom_image << "\n";
+      exit(-1);
+    }
+    if(fstat(rfd, &rst) < 0) {
+      std::cerr << "fstat failed on rom image " << rom_image << "\n";
+      exit(-1);
+    }
+    uint64_t off = (rom_pa >= 0x08000000ULL && rom_pa <= 0x17ffffffULL)
+                     ? (rom_pa & 0x0fffffffULL) : rom_pa;
+    if(off + (uint64_t)rst.st_size > 0x1f000000ULL) {
+      std::cerr << "rom image does not fit: dram 0x" << std::hex << off
+                << " + " << std::dec << rst.st_size << " bytes exceeds 496 MB\n";
+      exit(-1);
+    }
+    char *rbuf = (char*)mmap(nullptr, rst.st_size, PROT_READ, MAP_PRIVATE, rfd, 0);
+    if(rbuf == MAP_FAILED) {
+      std::cerr << "mmap failed on rom image " << rom_image << "\n";
+      exit(-1);
+    }
+    memcpy(c_addr + off, rbuf, rst.st_size);
+    munmap(rbuf, rst.st_size);
+    close(rfd);
+    std::cout << "loaded ROM image " << rom_image << " (" << rst.st_size
+              << " bytes) at phys 0x" << std::hex << rom_pa
+              << " (dram 0x" << off << ")" << std::dec << "\n";
+  }
   //for(int i = 0; i < 32; i++) {
   //std::cout << std::hex << pc+4*i << " : " << std::dec;
   //disassemble(std::cout, bswap<false>(*cptr), pc + 4*i); std::cout << "\n";
@@ -471,8 +664,16 @@ int main(int argc, char *argv[]) {
 
   FILE* g_trace=nullptr; int g_cdb_count=0; unsigned long g_nlog=0;
   FILE* g_rt_file=nullptr; unsigned long g_rt_fills=0, g_rt_entries=0, g_rt_rearm=0;
+  bool g_pct_dumped = false;
   while(c < max_iters && !done) {
     mon_poll();
+    /* poll the PC-trace frozen bit; dump ONCE when it latches */
+    if(!g_pct_dumped && (c & 0xffff) == 0) {
+      if((d->read32(0x19) >> 15) & 1) {
+        dump_pctrace(d);
+        g_pct_dumped = true;
+      }
+    }
     if(g_deeptrace && (c & 0x3ffff)==0){
       uint32_t wb=d->read32(0x1c); uint32_t cr4=d->read32(0x04); bool ov=(d->read32(0x26)>>11)&1;
       fprintf(stderr,"### deep-trace: wptr=%u (%u recs) ovf=%d ctrl=0x%08x bit21=%d\n", wb, wb/8, (int)ov, cr4, (cr4>>21)&1), fflush(stderr);
@@ -510,6 +711,39 @@ int main(int argc, char *argv[]) {
       d->write32(11, 0x00000007u);          /* bp_wp_val = 7 (the corrupt value) */
       d->write32(4, (8u|2u) | (1u<<17));     /* arm bp_enable */
       fprintf(stderr, "### ARMWPV armed: freeze on store 7 -> 0x1006e984\n");
+    }
+    /* ARMSIG: freeze the retire ring when the KERNEL decides to kill a process.
+     * bp_pc = force_sig_info (0x88044958 in debian.vmlinux.32) -- every fault-generated
+     * signal funnels through it, so this catches a wild jump whatever its target, not
+     * just the near-null ones the RTL null-target trigger sees (a gcc SIGSEGV at
+     * 0x781a8d14 went completely uncaptured).  It sits only a few hundred instructions
+     * after the fault, so the pre-jump userspace history still fits in the 32K ring --
+     * unlike show_regs, which runs after a printk to a 9600-baud console.
+     * REQUIRES a bitstream whose fault-trap excludes RI (cause 10); otherwise arming
+     * bp_enable also arms that trap and RDHWR emulation latches it instantly. */
+    /* ARMSIG DELAY GATE (2026-09-12).  /tmp/ARMSIG lives in tmpfs and survives a
+     * soak restart, so without this mips-axi re-arms during EARLY BOOT of every
+     * iteration and freezes on a routine boot-time RI->SIGILL (observed: BEFAULT
+     * cause=10 EPC=201257d4 while /init/busybox was still running).  Boot takes
+     * ~1-2 min; soak rounds are 20 min.  Waiting 300s puts arming solidly inside
+     * the stress-ng workload.  A 32-bit insn counter cannot be used for this --
+     * it wraps every ~286s at 15 MIPS.  Override with ARMSIG_DELAY (seconds). */
+    static const time_t g_armsig_t0 = time(nullptr);
+    static const long   g_armsig_delay =
+      getenv("ARMSIG_DELAY") ? strtol(getenv("ARMSIG_DELAY"), nullptr, 10) : 300;
+    if(!g_armed && (c & 0xFFFF)==0 && access("/tmp/ARMSIG", F_OK)==0
+       && (time(nullptr) - g_armsig_t0) >= g_armsig_delay){
+      g_armed = 5;
+      d->write32(9, 0x88020ca8u);            /* bp_pc = the tail-jump to force_sig_fault inside do_page_fault
+                                              (88020ca8: j 88040710 <force_sig_fault>) -- the bad-area
+                                              path, i.e. the kernel deciding a USER access is invalid.
+                                              Chosen over force_sig_info_to_task because that funnel is
+                                              reached only AFTER the fault handler + signal setup have
+                                              run, so the 1024-commit ring held 100% kernel code and the
+                                              faulting USER instruction was already gone.  From here the
+                                              kernel has run only exception entry + vma lookup. */
+      d->write32(4, (8u|2u) | (1u<<17));     /* arm bp_enable */
+      fprintf(stderr, "### ARMSIG armed [build=RIFIX2]: freeze on do_page_fault SIGSEGV path 0x88020ca8\n");
     }
     if(!g_armed && (c & 0xFFFF)==0 && access("/tmp/ARMSC", F_OK)==0){
       g_armed = 4;
@@ -564,12 +798,12 @@ int main(int argc, char *argv[]) {
     }
     if(g_armed==7 && g_rt_file){
       const uint32_t CR=(8u|2u)|(1u<<17)|g_l2nc|g_deeptrace;
-      d->write32(0x17, 0x800);                /* select retire-trace region (dbg_trace_index[11]=1) */
+      d->write32(0x17, 0u);                   /* core ring is the default region now (index[19]=0) */
       uint32_t wp = d->read32(0x19);
       uint32_t st26 = d->read32(0x26);        /* global frozen bits: [8]=fault [9]=wp [10]=bp-match */
       static int g_dbgfrz=0;
-      if(((st26>>8)&0x7u) && g_dbgfrz<4){ fprintf(stderr,"### DBGFRZ 0x19=%08x 0x26=%08x rt=%d flt=%d wp=%d bp=%d\n",wp,st26,(int)((wp>>8)&1),(int)((st26>>8)&1),(int)((st26>>9)&1),(int)((st26>>10)&1)); g_dbgfrz++; fflush(stderr); }
-      if(((wp>>8)&1) || ((st26>>8)&0x7u)){                          /* r_rt_frozen -> ring froze on a fault OR a bp_pc match */
+      if(((st26>>8)&0x7u) && g_dbgfrz<4){ fprintf(stderr,"### DBGFRZ 0x19=%08x 0x26=%08x rt=%d flt=%d wp=%d bp=%d\n",wp,st26,(int)((wp>>15)&1),(int)((st26>>8)&1),(int)((st26>>9)&1),(int)((st26>>10)&1)); g_dbgfrz++; fflush(stderr); }
+      if(((wp>>15)&1) || ((st26>>8)&0x7u)){                          /* r_rt_frozen -> ring froze on a fault OR a bp_pc match */
         /* fault context from the exc-ring (index[10]=1: w0=cause w1=epc w2=badvaddr w3=cycle w4=uop w5=fetched).
          * KEY: the exc-ring records ONLY t_arch_fault with cause 4/5/6/7/10 (w_exc_we in core.sv); a bp_pc
          * match does NOT write it.  A re-arm drops bp_enable which RESETS r_exc_wptr to 0.  Therefore, at a
@@ -625,7 +859,7 @@ int main(int argc, char *argv[]) {
           else if((g_rt_rearm % 64)==0)
             fprintf(stderr,"### re-arm #%lu past routine fault cause=%u epc=%08x badv=%08x\n",
                     (unsigned long)g_rt_rearm, cause, epc, badv), fflush(stderr);
-          d->write32(4, (8u|2u)|g_l2nc); d->write32(4, CR);   /* re-arm (drop+raise bp_enable, keep l2nc): reset+resume */
+          d->write32(4, (8u|2u)|g_l2nc|(1u<<18)); d->write32(4, CR);   /* re-arm (drop+raise bp_enable, keep l2nc): reset+resume */
         } else {
           const char* why = bpdump ? "BP-DUMP @off-golden trigger pc" : wp_birth ? "WP-BIRTH (small int stored @ producer pc)" : (wild_deref ? "WILD-DEREF @fault" : (wild_jump ? "WILD-JUMP @RI (SIGILL face)" : (bpkill ? "SIGNAL-KILL @sigtramp" : "BUS ERROR")));
           if(wp_birth) fprintf(stderr,"### *** WP-BIRTH CAUGHT: producer store DATA=0x%08x (a small int in a pointer field) -- window rooted AT the bad store ***\n", wpdata);
@@ -635,7 +869,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr,"### CHAR #%lu: %s cause=%u epc=%08x badv=%08x sp=%08x poison_pg=%08x fetched=%08x\n",
                     (unsigned long)g_rt_fills, why, cause, epc, badv, sp, sp & ~0xfffu, fetched);
             fflush(stderr);
-            d->write32(4, (8u|2u)|g_l2nc); d->write32(4, CR);   /* re-arm + resume -> catch the next crash */
+            d->write32(4, (8u|2u)|g_l2nc|(1u<<18)); d->write32(4, CR);   /* re-arm + resume -> catch the next crash */
           } else {
           fprintf(stderr,"### FRZ #%lu (REAL, %s sig=%u): ewp=%u exc[cause=%u epc=%08x badvaddr=%08x fetched=%08x]  (%lu re-arms)\n",
                   (unsigned long)g_rt_fills, why, sig_arg, ewp, cause, epc, badv, fetched, (unsigned long)g_rt_rearm);
@@ -748,7 +982,12 @@ int main(int argc, char *argv[]) {
       static uint32_t hpc[16], g_fcv[16]; static uint32_t hn=0;
       uint32_t st = d->read32(0x26);
       uint32_t cz = st & 31, wp_frz = (st>>9)&1, flt_frz = (st>>8)&1;
-      if(flt_frz || cz==4||cz==5||cz==6||cz==7||cz==10){
+      /* RI (cause 10) REMOVED 2026-09-12: this kernel emulates RDHWR via the RI
+       * handler (~1600 RI per 10M instrs on binutils, ~3800/s at 24 MIPS), so
+       * sampling the LIVE cause here eventually lands on one and aborts the run.
+       * Mirrors the same fix in core.sv w_fatal_cause -- the RTL trap and this
+       * host check are two independent copies of the same list. */
+      if(flt_frz || cz==4||cz==5||cz==6||cz==7){
         fprintf(stderr, "### HDR-FAULT cause=%u EPC=%08x BadVAddr=%08x (%u writes to 0x1006e600)\n",
                 cz, d->read32(0xb), d->read32(0xc), hn);
         uint32_t base=(hn>16)?(hn-16):0;
@@ -863,8 +1102,15 @@ int main(int argc, char *argv[]) {
     if(g_armed){
       static int n_trap = 0; const int STEP_N = 8;
       uint32_t cz = d->read32(0x26) & 31;
-      /* RTL froze the core at a fatal userspace fault -> {epc,cause,badvaddr,GPRs} STABLE */
-      if(cz==4||cz==5||cz==6||cz==7||cz==10){
+      /* RTL froze the core at a fatal userspace fault -> {epc,cause,badvaddr,GPRs} STABLE.
+       * RI (cause 10) is EXCLUDED: Debian TLS uses RDHWR, emulated via the RI
+       * handler, so RI fires constantly in normal userspace.  Leaving it here
+       * filled this 8-entry buffer within seconds of arming ARMSIG, ended the
+       * run, and swapsoak restarted -- a ~6 minute loop that never soaked and
+       * destroyed the frozen ring each time (observed 2026-09-12, iter002-004).
+       * The RTL's w_fatal_cause already excludes 5'd10; this host-side copy is a
+       * SEPARATE list and was missed when that fix was made. */
+      if(cz==4||cz==5||cz==6||cz==7){
         uint32_t epc = d->read32(0xb), bv = d->read32(0xc), pc = d->read32(7);
         fprintf(stderr, "### BEFAULT[%d] cause=%u EPC=%08x BadVAddr=%08x pc=%08x\n", n_trap, cz, epc, bv, pc);
         fprintf(stderr, "### GPRs[%d]:", n_trap);

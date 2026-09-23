@@ -15,7 +15,9 @@ bool cmdline(int argc,
 	     std::string &arcs_image,
 	     std::string &start_pc,
 	     std::string &cimg_name,
-	     std::string &disk_name) {
+	     std::string &disk_name,
+	     std::string &rom_image,
+	     std::string &rom_pa) {
   
   namespace po = boost::program_options;
   po::options_description desc("Options");  
@@ -32,6 +34,8 @@ bool cmdline(int argc,
     ("start-pc", po::value<std::string>(&start_pc)->default_value(""), "override start PC, e.g. 0xa0003000 (empty = ELF entry / sgi default)")
     ("cimg", po::value<std::string>(&cimg_name)->default_value(""), "checkpoint memory image (ckpt2preamble .cimg); skips ELF, forces sgi + pc=0xbfc00000, load preamble via --arcs")
     ("disk", po::value<std::string>(&disk_name)->default_value("/home/root/irix65-clean.img"), "disk image")
+      ("rom", po::value<std::string>(&rom_image)->default_value(""), "filesystem image preloaded into DRAM for the hcart block device (no DMA); empty = none")
+      ("rom-pa", po::value<std::string>(&rom_pa)->default_value("0x0c000000"), "MIPS physical address for --rom; must sit above the RAM the kernel is told about")
     ;
   try {
     po::variables_map vm;

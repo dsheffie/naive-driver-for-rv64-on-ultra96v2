@@ -63,9 +63,34 @@ struct enet_tap {
 
 /* ---- TX: walk the chain from nbdp, assemble one frame, set ETXD, write the tap.
  * Returns the number of bytes transmitted (0 on a short/empty chain). ---- */
+/* HPC3 TX chain semantics: EOXP ends a PACKET, EOX ends the CHAIN.  The walker below
+ * historically broke only on EOX, so a chain holding several queued packets was
+ * concatenated into ONE oversized frame and ETXD was stamped across every descriptor
+ * touched -- including packets the guest had not finished with.  TXWALK logs the flags
+ * per descriptor so we can see exactly how far a walk runs. */
+#ifndef HPC3_BC_EOXP
+#define HPC3_BC_EOXP 0x40000000u
+#endif
+/* Sentinel: the chain was torn / still being built.  The CALLER must leave the TX
+ * doorbell UNCONSUMED so the walk is retried, otherwise the packet is dropped. */
+#define ENET_TX_INCOMPLETE 0xffffffffu
 static inline uint32_t enet_tx_run(scsi_mem_fn mem, void *ctx, uint32_t nbdp, int tap_fd) {
-    uint8_t frame[ENET_FRAME_MAX];
+    static const bool g_txwalk = getenv("TXWALK") != nullptr;
+    uint8_t  frame[ENET_FRAME_MAX];
+    uint8_t *touched[64];
+    uint32_t touched_bc[64];
     uint32_t len = 0;
+    int ndesc = 0;
+    bool complete = false;
+
+    /* Walk the chain WITHOUT modifying it.  A packet is complete only when EOXP is
+     * seen: EOXP ends a PACKET, EOX ends the CHAIN.  A descriptor carrying a bare
+     * EOX is a STALE bit from that ring slot's previous use -- real HPC3 is a
+     * continuously-running engine and the guest appends to the chain live (clearing
+     * EOX on the old tail), so a polled walker CAN observe a half-built chain.
+     * Committing one of those is what corrupted IRIX: we marked ETXD on descriptors
+     * the guest had not finished with, it freed those mbufs, and the next chain walk
+     * chased a freed pointer -> TLBMISS in m_freem. */
     for(int guard = 0; guard < 64; guard++) {
         uint8_t *d = mem(ctx, nbdp, 12);
         if(!d) { break; }
@@ -78,16 +103,39 @@ static inline uint32_t enet_tx_run(scsi_mem_fn mem, void *ctx, uint32_t nbdp, in
             uint8_t *b = mem(ctx, bp, cnt);
             if(b) { memcpy(frame + len, b, cnt); len += cnt; }
         }
-        enet_put_be32(d + 4, bc | HPC3_BC_ETXD);        /* HPC transmitted this buffer */
-        if(bc & HPC3_BC_EOX) { break; }
+        touched[ndesc]    = d;
+        touched_bc[ndesc] = bc;
+        ndesc++;
+        if(bc & HPC3_BC_EOXP) { complete = true; break; }   /* end of PACKET */
+        if(bc & HPC3_BC_EOX)  { break; }                    /* chain end, no EOXP */
         nbdp = next;
     }
+
+    if(!complete) {
+        /* Torn / still-being-built chain.  Touch NOTHING and let the next poll retry
+         * -- same self-healing contract enet_rx_inject uses for a not-yet-armed
+         * descriptor.  Returning 0 also means no frame is emitted. */
+        if(g_txwalk) {
+            fprintf(stderr, "[txwalk] INCOMPLETE chain: ndesc=%d len=%u -- deferred, nothing marked\n",
+                    ndesc, len);
+        }
+        return ENET_TX_INCOMPLETE;
+    }
+
+    /* Complete packet: emit it FIRST, then mark the descriptors transmitted. */
     if(tap_fd >= 0 && len >= 14) {
         ssize_t n = ::write(tap_fd, frame, len);
         (void)n;
     }
+    for(int i = 0; i < ndesc; i++) {
+        enet_put_be32(touched[i] + 4, touched_bc[i] | HPC3_BC_ETXD);
+    }
+    if(g_txwalk) {
+        fprintf(stderr, "[txwalk] WALK ndesc=%d complete=1 total_len=%u\n", ndesc, len);
+    }
     return len;
 }
+
 
 /* ---- RX: deposit one inbound frame into the guest RX ring.
  * `nbdp` is walked and updated (the service's current ring position); on success

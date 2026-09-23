@@ -36,6 +36,13 @@ struct scsi_disk {
   uint64_t nblocks = 0;
   std::map<uint64_t, std::array<uint8_t,512>> overlay;   /* COW writes */
 
+  /* traffic counters -- reported by the monitor "diskstat" command.  Writes go
+   * only to the overlay, so n_wr_new also tracks how fast the overlay (and thus
+   * host RAM) is growing; a long soak can OOM the ARM box on this alone. */
+  uint64_t n_rd = 0, n_wr = 0;
+  uint64_t n_rd_overlay = 0, n_rd_image = 0, n_rd_zero = 0;
+  uint64_t n_wr_new = 0;
+
   /* XFS safety (learned once from the base image by scan_xfs) */
   std::vector<uint64_t> xfs_sb_lbas;              /* superblock LBAs (one per AG) */
   uint64_t xfs_log_lba0 = 0, xfs_log_lba1 = 0;    /* internal-log LBA range */
@@ -65,15 +72,25 @@ struct scsi_disk {
       }
       return;
     }
+    n_rd++;
     auto it = overlay.find(lba);
     if(it != overlay.end()) {
+      n_rd_overlay++;
       memcpy(dst, it->second.data(), 512);
       return;
     }
-    if(lba < nblocks && ::pread(fd, dst, 512, (off_t)lba * 512) == 512) return;
+    if(lba < nblocks && ::pread(fd, dst, 512, (off_t)lba * 512) == 512) {
+      n_rd_image++;
+      return;
+    }
+    n_rd_zero++;
     memset(dst, 0, 512);
   }
   void block_write(uint64_t lba, const uint8_t *src) {    /* writes go ONLY to the overlay */
+    n_wr++;
+    if(overlay.find(lba) == overlay.end()) {
+      n_wr_new++;
+    }
     std::array<uint8_t,512> b; memcpy(b.data(), src, 512); overlay[lba] = b;
   }
   size_t overlay_size() const {
