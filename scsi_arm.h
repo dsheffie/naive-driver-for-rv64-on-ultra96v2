@@ -100,6 +100,47 @@ static inline uint8_t *scsi_arm_mem(void *ctx, uint32_t phys, uint32_t len) {
  * of henry_tb's SVC_DELAY).  We deposit the data into DRAM, issue a full memory
  * barrier, and only then echo the doorbell -- so IRIX (which already did its
  * pre-DMA dma_cache_inv) reads the fresh data after completion. */
+
+/* ---- ARM-requested whole-cache flush (henry ctrl reg 4 bit 2) ----
+ * EXTFLUSH=1 enables it.  The core flushes L1D then L2 (dirty lines written back,
+ * everything invalidated) with its pipeline drained, like an injected IRQ.  Done
+ * BEFORE the device touches DRAM (so no dirty CPU data IRIX doesn't know about can
+ * be written over the deposit, and a disk write reads current data) and AGAIN after
+ * the deposit, before the completion doorbell (drops lines the OOO core refilled
+ * speculatively during the transfer).  ~/code/murphi/r9999_dma.m: pre + post is the
+ * combination that stays correct when IRIX skips its own invalidate.
+ * AXI reads: 0x25[31:16] = completed flushes, 0x25[1] = busy, 0x24[31:1] = cycles
+ * the last flush took. */
+static const bool g_extflush = getenv("EXTFLUSH") != nullptr;
+static uint64_t g_xf_n = 0, g_xf_cyc = 0, g_xf_max = 0;
+static inline void scsi_extflush(Driver *d) {
+  if(!g_extflush) {
+    return;
+  }
+  uint64_t spins = 0;
+  while(d->read32(0x25) & 2u) {                  /* a flush is still running */
+    if(++spins == 100000000ull) {
+      fprintf(stderr, "[xflush] WARNING: busy never cleared before request\n");
+    }
+  }
+  uint32_t n0 = d->read32(0x25) >> 16;
+  uint32_t cr = d->read32(4);
+  d->write32(4, cr | 4u);                        /* 0->1 edge starts one flush */
+  d->write32(4, cr & ~4u);
+  spins = 0;
+  while((d->read32(0x25) >> 16) == n0) {
+    if(++spins == 100000000ull) {
+      fprintf(stderr, "[xflush] WARNING: flush #%llu has not completed\n", (unsigned long long)g_xf_n);
+    }
+  }
+  uint64_t c = d->read32(0x24) >> 1;
+  g_xf_n++; g_xf_cyc += c; g_xf_max = (c > g_xf_max) ? c : g_xf_max;
+  if((g_xf_n & 1023u) == 0) {
+    fprintf(stderr, "[xflush] %llu flushes, avg %llu cycles, max %llu\n",
+            (unsigned long long)g_xf_n, (unsigned long long)(g_xf_cyc / g_xf_n), (unsigned long long)g_xf_max);
+  }
+}
+
 static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
   static uint32_t last_seq = 0;
   uint32_t seq = d->read32(SCSI_R_SEQ);
@@ -154,6 +195,7 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
     rsp.scsi_status = ST_SELECT_TRANSFER_SUCCESS; rsp.tgt_status = TGT_GOOD;
   }
   if(g_active) {
+    scsi_extflush(d);                            /* pre: before the device touches DRAM */
     moved = scsi_move(scsi_arm_mem, dram, req.nbdp,
                       g_buf.data() + g_pos, (uint32_t)(g_total - g_pos), g_to_dev);
     if(!g_to_dev && moved) {                     /* READ: log the physical DRAM ranges we deposited */
@@ -220,6 +262,7 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
   bool to_dev = false; uint64_t wr_lba = 0;
   scsi_service_run(&req, &rsp, disk, buf, to_dev, wr_lba);
   if(rsp.scsi_status == ST_SELECT_TRANSFER_SUCCESS && !buf.empty()) {
+    scsi_extflush(d);                            /* pre: before the device touches DRAM */
     moved = scsi_move(scsi_arm_mem, dram, req.nbdp,
                       buf.data(), (uint32_t)buf.size(), to_dev);
     if(to_dev) {                                /* WRITE: buf now holds DRAM data */
@@ -301,6 +344,9 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
   }
 
   __sync_synchronize();                         /* DRAM writes visible before completion */
+  if(moved) {
+    scsi_extflush(d);                            /* post: drop speculative refills of the buffer */
+  }
   d->write32(SCSI_W_RESID,   rsp.residual);
   d->write32(SCSI_W_STATUS,  ((uint32_t)rsp.tgt_status << 8) | rsp.scsi_status);
   d->write32(SCSI_W_RSP_SEQ, rsp.seq);          /* doorbell echo LAST -> shim completes */
