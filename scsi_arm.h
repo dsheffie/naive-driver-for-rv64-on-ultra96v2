@@ -99,6 +99,122 @@ static inline uint8_t *scsi_arm_mem_log(void *ctx, uint32_t phys, uint32_t len) 
   return p;
 }
 
+/* ---- SCSIENGINE=1: disk READs go through the RTL scsi_dma engine ----
+ * Instead of scsi_move() (the ARM writing guest DRAM directly through the PS port,
+ * invisible to the core's caches), the ARM streams the disk bytes as 16-byte beats
+ * into the SCSI beat FIFO (AXI 0x20-0x23, push on the 0x23 write; 0x25 bit0 = full)
+ * and the engine deposits them -- through the device-snoop shim, which writes back and
+ * invalidates each line in the core's caches around the store.  So a READ needs no ARM
+ * cache flush: SCSIENGINE_FLUSH=1 keeps the EXTFLUSH flushes on READs anyway (data-path
+ * change only, for an A/B).  WRITEs (mem->disk) still use scsi_move + EXTFLUSH.
+ * Beat byte order = henry_tb: word i of a beat holds stream bytes 4i..4i+3, byte 4i in
+ * [7:0] (a little-endian load on the ARM).
+ *
+ * Correctness check on every full chunk: wait for the engine to finish its chain
+ * (shim phase -> IDLE, SCSI_R_DBG[9:8]; dma_done means every store got its AXI
+ * response), then compare the guest buffers in DRAM with the disk bytes, BEFORE the
+ * completion doorbell (the guest is still waiting, so nothing races the compare).
+ * A short transfer (data < chain, e.g. INQUIRY) leaves the engine stalled for beats
+ * that never come; the shim aborts it at the doorbell as before, and it is not
+ * checked. */
+static const bool g_scsiengine = getenv("SCSIENGINE") != nullptr;
+static const bool g_scsiengine_flush = getenv("SCSIENGINE_FLUSH") != nullptr;
+enum { SCSI_W_BEAT0 = 0x20, SCSI_R_BEATFULL = 0x25 };
+static uint64_t g_se_reads = 0, g_se_bytes = 0, g_se_short = 0, g_se_timeout = 0;
+static uint64_t g_se_bad_reads = 0, g_se_bad_bytes = 0, g_se_unaligned = 0;
+
+/* Bytes the chain at nbdp describes (up to EOX), capped at maxlen.  Sets *unaligned
+ * if any descriptor's BP is not on a 16-byte line (the case the old engine broke). */
+static inline uint32_t scsi_chain_bytes(uint8_t *dram, uint32_t nbdp, uint32_t maxlen, bool *unaligned) {
+  uint32_t tot = 0;
+  *unaligned = false;
+  for(int gd = 0; gd < 128 && nbdp && tot < maxlen; gd++) {
+    uint8_t *dd = scsi_arm_mem(dram, nbdp, 12);
+    if(!dd) {
+      break;
+    }
+    uint32_t bp = hdma_be32(dd + 0), bc = hdma_be32(dd + 4);
+    uint32_t cnt = bc & HPC3_BC_COUNT;
+    if(cnt && (bp & 15u)) {
+      *unaligned = true;
+    }
+    tot += cnt;
+    if(bc & HPC3_BC_EOX) {
+      break;
+    }
+    nbdp = hdma_be32(dd + 8);
+  }
+  return tot < maxlen ? tot : maxlen;
+}
+
+/* Push len bytes as ceil(len/16) beats (the last one zero-padded; the engine only
+ * takes the bytes its descriptors ask for).  false = FIFO stayed full (engine wedged). */
+static inline bool scsi_engine_push(Driver *d, const uint8_t *src, uint32_t len) {
+  for(uint32_t off = 0; off < len; off += 16) {
+    uint32_t w[4] = {0, 0, 0, 0};
+    memcpy(w, src + off, (len - off) < 16 ? (len - off) : 16);
+    uint64_t spin = 0;
+    while(d->read32(SCSI_R_BEATFULL) & 1u) {
+      if(++spin > 10000000ull) {
+        return false;
+      }
+    }
+    d->write32(SCSI_W_BEAT0 + 0, w[0]);
+    d->write32(SCSI_W_BEAT0 + 1, w[1]);
+    d->write32(SCSI_W_BEAT0 + 2, w[2]);
+    d->write32(SCSI_W_BEAT0 + 3, w[3]);   /* 0x23 write pushes the beat */
+  }
+  return true;
+}
+
+/* Wait for the shim to leave PH_BUSY (engine pulsed dma_done).  false = timeout. */
+static inline bool scsi_engine_wait_idle(Driver *d) {
+  for(uint64_t spin = 0; spin < 10000000ull; spin++) {
+    if(((d->read32(SCSI_R_DBG) >> 8) & 3u) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/* Compare the chain's destination bytes in DRAM with ref[0..len). */
+static inline void scsi_engine_rdchk(uint8_t *dram, uint32_t nbdp, const uint8_t *ref, uint32_t len,
+                                     uint32_t seq, uint64_t lba) {
+  uint32_t off = 0, bad = 0, first_pa = 0, first_off = 0;
+  for(int gd = 0; gd < 128 && nbdp && off < len; gd++) {
+    uint8_t *dd = scsi_arm_mem(dram, nbdp, 12);
+    if(!dd) {
+      break;
+    }
+    uint32_t bp = hdma_be32(dd + 0), bc = hdma_be32(dd + 4);
+    uint32_t cnt = bc & HPC3_BC_COUNT;
+    if(cnt > len - off) {
+      cnt = len - off;
+    }
+    uint8_t *b = cnt ? scsi_arm_mem(dram, bp, cnt) : nullptr;
+    for(uint32_t i = 0; b && i < cnt; i++) {
+      if(b[i] != ref[off + i]) {
+        if(bad == 0) {
+          first_pa = bp + i;
+          first_off = off + i;
+        }
+        bad++;
+      }
+    }
+    off += cnt;
+    if(bc & HPC3_BC_EOX) {
+      break;
+    }
+    nbdp = hdma_be32(dd + 8);
+  }
+  if(bad) {
+    g_se_bad_reads++;
+    g_se_bad_bytes += bad;
+    fprintf(stderr, "[scsieng] RDCHK MISMATCH seq=%u lba=%llu: %u/%u bytes bad, first pa=%08x (off %u)\n",
+            seq, (unsigned long long)lba, bad, off, first_pa, first_off);
+  }
+}
+
 /* Poll the doorbell once; on a new command, service it end-to-end.  Call every
  * iteration of the driver's main loop.  Returns true iff a command was serviced.
  *
@@ -315,6 +431,7 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
   scsi_rsp_t rsp;
   rsp.seq = seq; rsp.completion = SCSI_DONE_COMPLETE;
   uint32_t moved = 0;
+  bool eng_rd = false;          /* SCSIENGINE READ: the device-snoop shim keeps it coherent */
 #ifdef FAITHFUL_SCSI
   /* Faithful chunked DMA (Stage A): carry the transfer across HPC3 descriptor-chain
    * EOX chunk boundaries.  IRIX programs the WD33C93 count for < the CDB length and
@@ -339,9 +456,42 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
   }
   if(g_active) {
     dma_ctx_set(DMA_DEV_SCSI, g_to_dev ? DMA_DIR_RD : DMA_DIR_WR, (uint32_t)g_hlba);
-    scsi_extflush(d, dram, req.nbdp, (uint32_t)(g_total - g_pos), false);   /* pre: before the device touches DRAM */
-    moved = scsi_move(scsi_arm_mem_log, dram, req.nbdp,
-                      g_buf.data() + g_pos, (uint32_t)(g_total - g_pos), g_to_dev);
+    eng_rd = g_scsiengine && !g_to_dev;
+    if(!eng_rd || g_scsiengine_flush) {
+      scsi_extflush(d, dram, req.nbdp, (uint32_t)(g_total - g_pos), false);   /* pre: before the device touches DRAM */
+    }
+    if(eng_rd) {
+      bool unal = false;
+      uint32_t chain = scsi_chain_bytes(dram, req.nbdp, 0xffffffffu, &unal);
+      uint32_t want = chain < (uint32_t)(g_total - g_pos) ? chain : (uint32_t)(g_total - g_pos);
+      g_se_reads++;
+      g_se_bytes += want;
+      g_se_unaligned += unal ? 1 : 0;
+      if(!scsi_engine_push(d, g_buf.data() + g_pos, want)) {
+        g_se_timeout++;
+        fprintf(stderr, "[scsieng] beat FIFO stuck full: seq=%u lba=%llu want=%u\n",
+                req.seq, (unsigned long long)g_hlba, want);
+      } else if(want < chain) {
+        g_se_short++;                            /* short: the shim aborts the engine */
+      } else if(!scsi_engine_wait_idle(d)) {
+        g_se_timeout++;
+        fprintf(stderr, "[scsieng] engine never finished: seq=%u lba=%llu want=%u dbg=%08x\n",
+                req.seq, (unsigned long long)g_hlba, want, d->read32(SCSI_R_DBG));
+      } else {
+        scsi_engine_rdchk(dram, req.nbdp, g_buf.data() + g_pos, want, req.seq, g_hlba);
+      }
+      moved = want;
+      if((g_se_reads & 1023u) == 0) {
+        fprintf(stderr, "[scsieng] reads=%llu bytes=%llu unaligned=%llu short=%llu timeout=%llu bad_reads=%llu bad_bytes=%llu\n",
+                (unsigned long long)g_se_reads, (unsigned long long)g_se_bytes,
+                (unsigned long long)g_se_unaligned, (unsigned long long)g_se_short,
+                (unsigned long long)g_se_timeout, (unsigned long long)g_se_bad_reads,
+                (unsigned long long)g_se_bad_bytes);
+      }
+    } else {
+      moved = scsi_move(scsi_arm_mem_log, dram, req.nbdp,
+                        g_buf.data() + g_pos, (uint32_t)(g_total - g_pos), g_to_dev);
+    }
     if(!g_to_dev && moved) {                     /* READ: log the physical DRAM ranges we deposited */
       uint32_t nb = req.nbdp, done = 0;
       for(int gd = 0; gd < 128 && nb && done < moved; gd++) {
@@ -489,7 +639,7 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
   }
 
   __sync_synchronize();                         /* DRAM writes visible before completion */
-  if(moved && !(g_xfpages && to_dev)) {
+  if(moved && !(g_xfpages && to_dev) && (!eng_rd || g_scsiengine_flush)) {
     /* post: drop speculative refills of the buffer.  Page mode skips it for a disk
      * WRITE: the device only read memory, so there is nothing to drop. */
     scsi_extflush(d, dram, req.nbdp, moved, true);
