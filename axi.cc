@@ -55,6 +55,14 @@ static const uint64_t memsize = 496*MB;
 static uint64_t phys_addr = ~0UL;
 
 static uint8_t *c_addr = nullptr;
+/* monitor `mem` command: read a guest-physical word through the same map the
+ * ENET/SCSI servicers use (enet_fpga_map), so a kernel-side mailbox written via
+ * kseg1 can be read back after the guest freezes.  Not static: called from mon.cc. */
+uint32_t mon_rdphys(uint32_t phys) {
+  uint32_t off = (phys >= 0x08000000u && phys <= 0x17ffffffu) ? (phys & 0x0fffffffu)
+               : (phys >= 0x1f000000u) ? (0x10000000u | (phys & 0x00ffffffu)) : phys;
+  return ((uint32_t)c_addr[off]<<24)|((uint32_t)c_addr[off+1]<<16)|((uint32_t)c_addr[off+2]<<8)|(uint32_t)c_addr[off+3];
+}
 static uint32_t rdbe(uint32_t pa){ return ((uint32_t)c_addr[pa]<<24)|((uint32_t)c_addr[pa+1]<<16)|((uint32_t)c_addr[pa+2]<<8)|(uint32_t)c_addr[pa+3]; }
 static volatile sig_atomic_t g_dumpreq = 0;
 static int g_armed = 0;

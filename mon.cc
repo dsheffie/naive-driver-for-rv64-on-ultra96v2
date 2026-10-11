@@ -343,6 +343,16 @@ static void mon_cmd(char *line) {
     snprintf(out, sizeof(out), "[reset -- halted at reset vector, pc=%08x; use step]\r\n", d->read32(7));
     mon_send(out);
   }
+  else if(!strncmp(line, "mem", 3)) {
+    /* mem <hex guest phys> [nwords]: dump guest memory (default 12 words) */
+    extern uint32_t mon_rdphys(uint32_t);
+    unsigned long pa = 0; int n = 12; char out[512];
+    sscanf(line + 3, "%lx %d", &pa, &n);
+    if(n > 32) n = 32;
+    int o = snprintf(out, sizeof out, "mem %08lx:", pa);
+    for(int i = 0; i < n; i++) o += snprintf(out + o, sizeof out - o, " %08x", mon_rdphys((uint32_t)(pa + 4*i)));
+    snprintf(out + o, sizeof out - o, "\r\n"); mon_send(out);
+  }
   else if(!strncmp(line, "halt", 4) || line[0] == 'h') {
     g_cr |= (1u << 31);                     /* single-step mode = freeze */
     d->write32(4, g_cr);

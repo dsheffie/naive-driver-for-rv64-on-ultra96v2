@@ -29,7 +29,8 @@
 
 #include "driver.hh"        // Driver: read32(port) / write32(port,val) / get_vaddr()
 #include "scsi_service.h"   // scsi_disk, scsi_move, scsi_service_run  (+ henry_scsi.h)
-#include "scsi_lastcmd.h"    // g_last_scsi -- snapshot for the "scsi" monitor dump
+#include "scsi_lastcmd.h"
+#include "dma_log.h"         // DMALOG: ARM-side guest DRAM access log    // g_last_scsi -- snapshot for the "scsi" monitor dump
 #include <cstdint>
 #include <vector>
 #include <cstdio>          // CDB logging (IRIX root-mount debug)
@@ -88,6 +89,15 @@ static inline uint8_t *scsi_arm_mem(void *ctx, uint32_t phys, uint32_t len) {
   if(bad || (uint64_t)off + len > SCSI_DRAM_WINDOW) return nullptr;
   return reinterpret_cast<uint8_t*>(ctx) + off;
 }
+/* Same, plus a DMALOG record: used ONLY for the real transfer (scsi_move), so the
+ * diagnostic descriptor re-walks below do not pollute the log. */
+static inline uint8_t *scsi_arm_mem_log(void *ctx, uint32_t phys, uint32_t len) {
+  uint8_t *p = scsi_arm_mem(ctx, phys, len);
+  if(p != nullptr) {
+    dma_log(phys, len);
+  }
+  return p;
+}
 
 /* Poll the doorbell once; on a new command, service it end-to-end.  Call every
  * iteration of the driver's main loop.  Returns true iff a command was serviced.
@@ -112,11 +122,123 @@ static inline uint8_t *scsi_arm_mem(void *ctx, uint32_t phys, uint32_t len) {
  * AXI reads: 0x25[31:16] = completed flushes, 0x25[1] = busy, 0x24[31:1] = cycles
  * the last flush took. */
 static const bool g_extflush = getenv("EXTFLUSH") != nullptr;
+/* XFPAGES=1 (with EXTFLUSH=1): flush only the transfer's pages instead of the whole
+ * cache.  The ARM reads the HPC3 descriptor chain FIRST to find them -- it relies on
+ * IRIX's own descriptor writeback (its CACHE ops write through to DRAM), which the
+ * whole-cache mode did not need.  Pre-transfer: write back + invalidate each page
+ * (AXI write 0x3C per page, then 0x3D=0 go).  Post-deposit (disk READ only): drop
+ * each page, no writeback (0x3D=1).  More than 16 pages -> the whole-cache flush.
+ * 0x25[15:2] counts dirty lines a drop found: nonzero = a page was not clean at the
+ * deposit, i.e. a real coherence bug -- reported the moment it moves. */
+static const bool g_xfpages = getenv("XFPAGES") != nullptr;
+static const uint32_t XF_MAX_PAGES = 16;
 static uint64_t g_xf_n = 0, g_xf_cyc = 0, g_xf_max = 0;
-static inline void scsi_extflush(Driver *d) {
+static uint64_t g_xf_lists = 0, g_xf_pages = 0, g_xf_whole = 0;
+static uint32_t g_xf_dirty = 0;
+/* CHAINCHK=1 (validation, with XFPAGES=1): before a pre-transfer page list, read the
+ * chain, force a WHOLE flush (pushes out any dirty descriptor line IRIX failed to
+ * write back), read it again and compare.  Any mismatch means the page mode's
+ * read-the-chain-first assumption is broken.  Costs a whole flush per command. */
+static const bool g_chainchk = getenv("CHAINCHK") != nullptr;
+static uint64_t g_cc_n = 0, g_cc_bad = 0;
+
+/* distinct 4KB pages covered by the first `len` bytes of the chain at nbdp; returns
+ * false (use the whole flush) if there are more than XF_MAX_PAGES or the chain is
+ * unreadable */
+static inline bool scsi_chain_pages(uint8_t *dram, uint32_t nbdp, uint32_t len,
+                                    uint32_t *pg, uint32_t *npg) {
+  *npg = 0;
+  uint32_t done = 0;
+  for(int nd = 0; nd < 128 && nbdp && done < len; nd++) {
+    uint8_t *dd = scsi_arm_mem(dram, nbdp, 12);
+    if(!dd) {
+      return false;
+    }
+    uint32_t bp = hdma_be32(dd+0), bc = hdma_be32(dd+4);
+    uint32_t cnt = bc & HPC3_BC_COUNT;
+    if(cnt > len - done) {
+      cnt = len - done;
+    }
+    if(cnt) {
+      for(uint32_t p = bp >> 12; p <= ((bp + cnt - 1) >> 12); p++) {
+        bool seen = false;
+        for(uint32_t i = 0; i < *npg; i++) {
+          if(pg[i] == p) {
+            seen = true;
+          }
+        }
+        if(!seen) {
+          if(*npg == XF_MAX_PAGES) {
+            return false;
+          }
+          pg[(*npg)++] = p;
+        }
+      }
+    }
+    done += cnt;
+    if(bc & HPC3_BC_EOX) {
+      break;
+    }
+    nbdp = hdma_be32(dd+8);
+  }
+  return true;
+}
+
+static inline void scsi_whole_flush(Driver *d) {
+  while(d->read32(0x25) & 2u) {
+  }
+  uint32_t n0 = d->read32(0x25) >> 16;
+  uint32_t cr = d->read32(4);
+  d->write32(4, cr | 4u);
+  d->write32(4, cr & ~4u);
+  while((d->read32(0x25) >> 16) == n0) {
+  }
+}
+
+/* raw chain snapshot: {bp, bc, nbdp} per descriptor, up to 64 */
+static inline int scsi_chain_snap(uint8_t *dram, uint32_t nbdp, uint32_t *w) {
+  int nd = 0;
+  for(; nd < 64 && nbdp; nd++) {
+    uint8_t *dd = scsi_arm_mem(dram, nbdp, 12);
+    if(!dd) {
+      break;
+    }
+    w[3*nd+0] = hdma_be32(dd+0);
+    w[3*nd+1] = hdma_be32(dd+4);
+    w[3*nd+2] = hdma_be32(dd+8);
+    if(w[3*nd+1] & HPC3_BC_EOX) {
+      nd++;
+      break;
+    }
+    nbdp = w[3*nd+2];
+  }
+  return nd;
+}
+
+static inline void scsi_extflush(Driver *d, uint8_t *dram, uint32_t nbdp, uint32_t len, bool drop) {
   if(!g_extflush) {
     return;
   }
+  if(g_xfpages && g_chainchk && !drop) {
+    static uint32_t w0[3*64], w1[3*64];
+    int n0 = scsi_chain_snap(dram, nbdp, w0);
+    scsi_whole_flush(d);
+    int n1 = scsi_chain_snap(dram, nbdp, w1);
+    g_cc_n++;
+    if(n0 != n1 || memcmp(w0, w1, sizeof(uint32_t) * 3 * n0) != 0) {
+      g_cc_bad++;
+      fprintf(stderr, "[chainchk] MISMATCH #%llu: nbdp 0x%08x ndesc %d -> %d\n",
+              (unsigned long long)g_cc_bad, nbdp, n0, n1);
+    }
+    if((g_cc_n & 1023u) == 0) {
+      fprintf(stderr, "[chainchk] %llu chains checked, %llu mismatches\n",
+              (unsigned long long)g_cc_n, (unsigned long long)g_cc_bad);
+    }
+  }
+  uint32_t pg[XF_MAX_PAGES], npg = 0;
+  /* too many pages -> the whole flush.  After a deposit that writes back instead of
+   * dropping, which is safe because the pre-transfer flush left the buffer clean. */
+  bool list = g_xfpages && scsi_chain_pages(dram, nbdp, len, pg, &npg);
   uint64_t spins = 0;
   while(d->read32(0x25) & 2u) {                  /* a flush is still running */
     if(++spins == 100000000ull) {
@@ -124,24 +246,45 @@ static inline void scsi_extflush(Driver *d) {
     }
   }
   uint32_t n0 = d->read32(0x25) >> 16;
-  uint32_t cr = d->read32(4);
-  d->write32(4, cr | 4u);                        /* 0->1 edge starts one flush */
-  d->write32(4, cr & ~4u);
+  if(list) {
+    for(uint32_t i = 0; i < npg; i++) {
+      d->write32(0x3c, pg[i]);                   /* push a page number */
+    }
+    d->write32(0x3d, drop ? 1u : 0u);            /* go: walk the list */
+    g_xf_lists++;
+    g_xf_pages += npg;
+  }
+  else {
+    uint32_t cr = d->read32(4);
+    d->write32(4, cr | 4u);                      /* 0->1 edge starts one whole flush */
+    d->write32(4, cr & ~4u);
+    g_xf_whole++;
+  }
   spins = 0;
   while((d->read32(0x25) >> 16) == n0) {
     if(++spins == 100000000ull) {
       fprintf(stderr, "[xflush] WARNING: flush #%llu has not completed\n", (unsigned long long)g_xf_n);
     }
   }
+  uint32_t st = d->read32(0x25);
+  uint32_t dirty = (st >> 2) & 0x3fffu;
+  if(dirty != g_xf_dirty) {
+    fprintf(stderr, "[xflush] DIRTY DROP: %u dirty lines found (was %u) -- nbdp 0x%08x len %u, %u pages\n",
+            dirty, g_xf_dirty, nbdp, len, npg);
+    g_xf_dirty = dirty;
+  }
   uint64_t c = d->read32(0x24) >> 1;
   g_xf_n++; g_xf_cyc += c; g_xf_max = (c > g_xf_max) ? c : g_xf_max;
   if((g_xf_n & 1023u) == 0) {
-    fprintf(stderr, "[xflush] %llu flushes, avg %llu cycles, max %llu\n",
-            (unsigned long long)g_xf_n, (unsigned long long)(g_xf_cyc / g_xf_n), (unsigned long long)g_xf_max);
+    fprintf(stderr, "[xflush] %llu flushes (%llu page lists, avg %.1f pages; %llu whole), avg %llu cycles, max %llu, dirty drops %u\n",
+            (unsigned long long)g_xf_n, (unsigned long long)g_xf_lists,
+            g_xf_lists ? (double)g_xf_pages / g_xf_lists : 0.0, (unsigned long long)g_xf_whole,
+            (unsigned long long)(g_xf_cyc / g_xf_n), (unsigned long long)g_xf_max, g_xf_dirty);
   }
 }
 
 static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
+  g_dma_drv = d;                                  /* DMALOG sync records read the cycle counter */
   static uint32_t last_seq = 0;
   uint32_t seq = d->read32(SCSI_R_SEQ);
   if(seq == last_seq) return false;
@@ -195,8 +338,9 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
     rsp.scsi_status = ST_SELECT_TRANSFER_SUCCESS; rsp.tgt_status = TGT_GOOD;
   }
   if(g_active) {
-    scsi_extflush(d);                            /* pre: before the device touches DRAM */
-    moved = scsi_move(scsi_arm_mem, dram, req.nbdp,
+    dma_ctx_set(DMA_DEV_SCSI, g_to_dev ? DMA_DIR_RD : DMA_DIR_WR, (uint32_t)g_hlba);
+    scsi_extflush(d, dram, req.nbdp, (uint32_t)(g_total - g_pos), false);   /* pre: before the device touches DRAM */
+    moved = scsi_move(scsi_arm_mem_log, dram, req.nbdp,
                       g_buf.data() + g_pos, (uint32_t)(g_total - g_pos), g_to_dev);
     if(!g_to_dev && moved) {                     /* READ: log the physical DRAM ranges we deposited */
       uint32_t nb = req.nbdp, done = 0;
@@ -262,8 +406,9 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
   bool to_dev = false; uint64_t wr_lba = 0;
   scsi_service_run(&req, &rsp, disk, buf, to_dev, wr_lba);
   if(rsp.scsi_status == ST_SELECT_TRANSFER_SUCCESS && !buf.empty()) {
-    scsi_extflush(d);                            /* pre: before the device touches DRAM */
-    moved = scsi_move(scsi_arm_mem, dram, req.nbdp,
+    dma_ctx_set(DMA_DEV_SCSI, to_dev ? DMA_DIR_RD : DMA_DIR_WR, 0);
+    scsi_extflush(d, dram, req.nbdp, (uint32_t)buf.size(), false);   /* pre: before the device touches DRAM */
+    moved = scsi_move(scsi_arm_mem_log, dram, req.nbdp,
                       buf.data(), (uint32_t)buf.size(), to_dev);
     if(to_dev) {                                /* WRITE: buf now holds DRAM data */
       size_t nb = moved / 512;
@@ -344,8 +489,10 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
   }
 
   __sync_synchronize();                         /* DRAM writes visible before completion */
-  if(moved) {
-    scsi_extflush(d);                            /* post: drop speculative refills of the buffer */
+  if(moved && !(g_xfpages && to_dev)) {
+    /* post: drop speculative refills of the buffer.  Page mode skips it for a disk
+     * WRITE: the device only read memory, so there is nothing to drop. */
+    scsi_extflush(d, dram, req.nbdp, moved, true);
   }
   d->write32(SCSI_W_RESID,   rsp.residual);
   d->write32(SCSI_W_STATUS,  ((uint32_t)rsp.tgt_status << 8) | rsp.scsi_status);
