@@ -114,6 +114,7 @@ static inline uint8_t *scsi_arm_mem_log(void *ctx, uint32_t phys, uint32_t len) 
  * (shim phase -> IDLE, SCSI_R_DBG[9:8]; dma_done means every store got its AXI
  * response), then compare the guest buffers in DRAM with the disk bytes, BEFORE the
  * completion doorbell (the guest is still waiting, so nothing races the compare).
+ * The first 3 engine READs are logged, then a stats line every 256.
  * A short transfer (data < chain, e.g. INQUIRY) leaves the engine stalled for beats
  * that never come; the shim aborts it at the doorbell as before, and it is not
  * checked. */
@@ -481,7 +482,11 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
         scsi_engine_rdchk(dram, req.nbdp, g_buf.data() + g_pos, want, req.seq, g_hlba);
       }
       moved = want;
-      if((g_se_reads & 1023u) == 0) {
+      if(g_se_reads <= 3) {                      /* positive proof the engine path is live */
+        fprintf(stderr, "[scsieng] engine READ #%llu seq=%u lba=%llu want=%u chain=%u unaligned=%d\n",
+                (unsigned long long)g_se_reads, req.seq, (unsigned long long)g_hlba, want, chain, (int)unal);
+      }
+      if((g_se_reads & 255u) == 0) {
         fprintf(stderr, "[scsieng] reads=%llu bytes=%llu unaligned=%llu short=%llu timeout=%llu bad_reads=%llu bad_bytes=%llu\n",
                 (unsigned long long)g_se_reads, (unsigned long long)g_se_bytes,
                 (unsigned long long)g_se_unaligned, (unsigned long long)g_se_short,
