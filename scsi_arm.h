@@ -36,6 +36,8 @@
 #include <cstdio>          // CDB logging (IRIX root-mount debug)
 #include <unistd.h>        // usleep (chain-coherence re-read diag)
 #include <map>             // write->read round-trip map (SCSIHASH diag)
+#include <ctime>           // SCSIRINGS completion timeout
+#include "ring_service.h"  // staging rings (docs/arm-device-protocol.md), shared with henry_tb
 
 enum {
   SCSI_R_SEQ      = 0x30, SCSI_R_CDB0 = 0x31, SCSI_R_CDB1 = 0x32, SCSI_R_CDB2 = 0x33,
@@ -120,10 +122,36 @@ static inline uint8_t *scsi_arm_mem_log(void *ctx, uint32_t phys, uint32_t len) 
  * that never come; the shim aborts it at the doorbell as before, and it is not
  * checked. */
 static const bool g_scsiengine = getenv("SCSIENGINE") != nullptr;
+/* Called from the SCSIENGINE spin loops (beat FIFO full, waiting for the engine) so a long
+ * disk burst does not starve the rest of the main loop -- ENET in particular: servicing a
+ * SCSI command to completion with ENET idle let TCP back off until the soak STALLED
+ * (2026-10-12, with and without EXTFLUSH).  axi.cc points it at enet_arm_poll. */
+static void (*g_scsi_idle_hook)(void) = nullptr;
+static inline void scsi_idle(uint64_t spin) {
+  if(g_scsi_idle_hook && (spin & 63u) == 0) {
+    g_scsi_idle_hook();
+  }
+}
 static const bool g_scsiengine_flush = getenv("SCSIENGINE_FLUSH") != nullptr;
+/* SCSIRINGS=1: SCSI data through the staging rings (needs a bit built with
+ * SCSI_RINGS).  The ARM never touches guest memory: READ data is staged, WRITE data
+ * comes back gathered by the engine, and each chain's completion (carrying the
+ * shim's req_seq) says how many bytes it moved -- no descriptor walking here. */
+static const bool g_scsirings = getenv("SCSIRINGS") != nullptr;
+static scsi_ring_t g_sring;
+static uint64_t g_sr_timeout = 0;
 enum { SCSI_W_BEAT0 = 0x20, SCSI_R_BEATFULL = 0x25 };
 static uint64_t g_se_reads = 0, g_se_bytes = 0, g_se_short = 0, g_se_timeout = 0;
 static uint64_t g_se_bad_reads = 0, g_se_bad_bytes = 0, g_se_unaligned = 0, g_se_writes = 0;
+/* every 256 engine commands, reads OR writes (reads-only went silent once the guest's
+ * page cache absorbed the soak's reads) */
+static void scsi_eng_stats(void) {
+  fprintf(stderr, "[scsieng] reads=%llu writes=%llu bytes=%llu unaligned=%llu short=%llu timeout=%llu bad_reads=%llu bad_bytes=%llu\n",
+          (unsigned long long)g_se_reads, (unsigned long long)g_se_writes, (unsigned long long)g_se_bytes,
+          (unsigned long long)g_se_unaligned, (unsigned long long)g_se_short,
+          (unsigned long long)g_se_timeout, (unsigned long long)g_se_bad_reads,
+          (unsigned long long)g_se_bad_bytes);
+}
 
 /* Bytes the chain at nbdp describes (up to EOX), capped at maxlen.  Sets *unaligned
  * if any descriptor's BP is not on a 16-byte line (the case the old engine broke). */
@@ -160,6 +188,7 @@ static inline bool scsi_engine_push(Driver *d, const uint8_t *src, uint32_t len)
       if(++spin > 10000000ull) {
         return false;
       }
+      scsi_idle(spin);
     }
     d->write32(SCSI_W_BEAT0 + 0, w[0]);
     d->write32(SCSI_W_BEAT0 + 1, w[1]);
@@ -175,6 +204,7 @@ static inline bool scsi_engine_wait_idle(Driver *d) {
     if(((d->read32(SCSI_R_DBG) >> 8) & 3u) == 0) {
       return true;
     }
+    scsi_idle(spin + 1);
   }
   return false;
 }
@@ -461,10 +491,50 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
     dma_ctx_set(DMA_DEV_SCSI, g_to_dev ? DMA_DIR_RD : DMA_DIR_WR, (uint32_t)g_hlba);
     eng_rd = g_scsiengine && !g_to_dev;
     eng_wr = g_scsiengine && g_to_dev;
-    if(!(eng_rd || eng_wr) || g_scsiengine_flush) {
+    if(!g_scsirings && (!(eng_rd || eng_wr) || g_scsiengine_flush)) {
       scsi_extflush(d, dram, req.nbdp, (uint32_t)(g_total - g_pos), false);   /* pre: before the device touches DRAM */
     }
-    if(eng_rd) {
+    if(g_scsirings) {
+      uint32_t rem = (uint32_t)(g_total - g_pos);
+      if(!g_to_dev) {
+        scsi_ring_stage_read(&g_sring, g_buf.data() + g_pos, rem, req.seq);
+      }
+      scsi_cqe_t e;
+      bool got = false;
+      struct timespec t0, t1;
+      clock_gettime(CLOCK_MONOTONIC, &t0);
+      for(uint64_t spin = 0; ; spin++) {
+        if(scsi_ring_poll(&g_sring, req.seq, &e)) {
+          got = true;
+          break;
+        }
+        scsi_idle(spin);                         /* keep ENET serviced meanwhile */
+        if((spin & 0xfff) == 0) {
+          clock_gettime(CLOCK_MONOTONIC, &t1);
+          if(t1.tv_sec - t0.tv_sec > 10) {
+            break;
+          }
+        }
+      }
+      if(got) {
+        moved = (e.bytes < rem) ? e.bytes : rem;
+        if(g_to_dev) {
+          scsi_ring_read_wr(&g_sring, g_buf.data() + g_pos, moved);
+        }
+      }
+      else {
+        g_sr_timeout++;
+        moved = 0;
+        fprintf(stderr, "[scsiring] no completion for seq=%u lba=%llu dir=%d (cq_cons=%u)\n",
+                req.seq, (unsigned long long)g_hlba, (int)g_to_dev, g_sring.cq_cons);
+      }
+      if(((g_sring.chains + g_sr_timeout) & 1023u) == 0) {
+        fprintf(stderr, "[scsiring] chains=%llu skipped=%llu staged=%llu gathered=%llu timeout=%llu\n",
+                (unsigned long long)g_sring.chains, (unsigned long long)g_sring.skipped,
+                (unsigned long long)g_sring.bytes_rd, (unsigned long long)g_sring.bytes_wr,
+                (unsigned long long)g_sr_timeout);
+      }
+    } else if(eng_rd) {
       bool unal = false;
       uint32_t chain = scsi_chain_bytes(dram, req.nbdp, 0xffffffffu, &unal);
       uint32_t want = chain < (uint32_t)(g_total - g_pos) ? chain : (uint32_t)(g_total - g_pos);
@@ -489,12 +559,8 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
         fprintf(stderr, "[scsieng] engine READ #%llu seq=%u lba=%llu want=%u chain=%u unaligned=%d\n",
                 (unsigned long long)g_se_reads, req.seq, (unsigned long long)g_hlba, want, chain, (int)unal);
       }
-      if((g_se_reads & 255u) == 0) {
-        fprintf(stderr, "[scsieng] reads=%llu writes=%llu bytes=%llu unaligned=%llu short=%llu timeout=%llu bad_reads=%llu bad_bytes=%llu\n",
-                (unsigned long long)g_se_reads, (unsigned long long)g_se_writes, (unsigned long long)g_se_bytes,
-                (unsigned long long)g_se_unaligned, (unsigned long long)g_se_short,
-                (unsigned long long)g_se_timeout, (unsigned long long)g_se_bad_reads,
-                (unsigned long long)g_se_bad_bytes);
+      if(((g_se_reads + g_se_writes) & 255u) == 0) {
+        scsi_eng_stats();
       }
     } else if(eng_wr) {
       /* WRITE (mem->disk) with no ARM flush: the engine walks this chain and loads every
@@ -502,6 +568,9 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
        * to DRAM).  Once the shim is idle (dma_done) DRAM is current, so the ARM reads it
        * with scsi_move exactly as before -- the engine's own disk beats go unused. */
       g_se_writes++;
+      if(((g_se_reads + g_se_writes) & 255u) == 0) {
+        scsi_eng_stats();
+      }
       if(!scsi_engine_wait_idle(d)) {
         g_se_timeout++;
         fprintf(stderr, "[scsieng] WRITE engine never finished: seq=%u lba=%llu dbg=%08x\n",
@@ -517,7 +586,7 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
       moved = scsi_move(scsi_arm_mem_log, dram, req.nbdp,
                         g_buf.data() + g_pos, (uint32_t)(g_total - g_pos), g_to_dev);
     }
-    if(!g_to_dev && moved) {                     /* READ: log the physical DRAM ranges we deposited */
+    if(!g_to_dev && moved && !g_scsirings) {     /* READ: log the physical DRAM ranges we deposited */
       uint32_t nb = req.nbdp, done = 0;
       for(int gd = 0; gd < 128 && nb && done < moved; gd++) {
         uint8_t *dd = scsi_arm_mem(dram, nb, 12); if(!dd) break;
@@ -534,6 +603,8 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
     }
     if(g_scsihash) {                             /* accumulate FNV-1a payload hash, both directions */
       if(g_to_dev) {                             /* WRITE: hash the bytes the CORE emitted (from g_buf) */
+        for(uint32_t i = 0; i < moved; i++) { g_hash ^= g_buf[g_pos+i]; g_hash *= 1099511628211ULL; }
+      } else if(g_scsirings) {                   /* READ (rings): hash the bytes staged */
         for(uint32_t i = 0; i < moved; i++) { g_hash ^= g_buf[g_pos+i]; g_hash *= 1099511628211ULL; }
       } else {                                   /* READ: hash the DRAM the core will read back */
         uint32_t nb = req.nbdp, done = 0;
@@ -664,7 +735,7 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk, uint8_t *dram) {
   }
 
   __sync_synchronize();                         /* DRAM writes visible before completion */
-  if(moved && !(g_xfpages && to_dev) && (!(eng_rd || eng_wr) || g_scsiengine_flush)) {
+  if(moved && !g_scsirings && !(g_xfpages && to_dev) && (!(eng_rd || eng_wr) || g_scsiengine_flush)) {
     /* post: drop speculative refills of the buffer.  Page mode skips it for a disk
      * WRITE: the device only read memory, so there is nothing to drop. */
     scsi_extflush(d, dram, req.nbdp, moved, true);

@@ -80,9 +80,174 @@ static inline uint8_t *enet_arm_mem_log(void *ctx, uint32_t phys, uint32_t len) 
  * path too, like SCSI -- the ARM memcpys frames to/from guest DRAM, so without it
  * TX can read stale data and RX can be shadowed by stale or dirty cache lines. */
 static const bool g_enetflush = getenv("ENETFLUSH") != nullptr;
+
+#include "enet_arm_engine.h"
+/* ENETENGINE=1: the RTL enet_dma engine walks both rings through the snoop shim, so
+ * every guest memory access is coherent and no flush is needed.  The ARM only moves
+ * frame bytes between the tap and the engine's beat FIFOs. */
+static const bool g_enetengine = getenv("ENETENGINE") != nullptr;
+static uint64_t g_ee_chains = 0, g_ee_pkts = 0, g_ee_rx = 0, g_ee_rxdrop = 0, g_ee_badlen = 0, g_ee_torn = 0;
+static inline void enet_eng_stats(void) {
+  fprintf(stderr, "[eneteng] chains=%llu pkts=%llu rx=%llu rxdrop=%llu badlen=%llu torn=%llu\n",
+          (unsigned long long)g_ee_chains, (unsigned long long)g_ee_pkts, (unsigned long long)g_ee_rx,
+          (unsigned long long)g_ee_rxdrop, (unsigned long long)g_ee_badlen, (unsigned long long)g_ee_torn);
+}
+
+/* Split the engine's TX byte stream into packets.  The engine packs every descriptor's
+ * bytes back to back but knows nothing of EOXP, and a chain can hold several packets
+ * (see enet_tx_run).  By tx_done the engine has read every descriptor through the
+ * snoop shim (written back + invalidated in the CPU caches), so the copy in DRAM is
+ * current: walk it for the per-descriptor counts, EOXP boundaries and the chain end,
+ * stopping exactly where the engine stopped (tx_len bytes on a packet boundary, EOX,
+ * a null link, or 255 descriptors).
+ * The data itself comes only from the beats.  Returns tx_end (the TX CRBDP). */
+static inline uint32_t enet_eng_emit(enet_tap *tap, uint8_t *dram, uint32_t nbdp, uint32_t txlen) {
+  uint32_t off = 0, pkt = 0, sum = 0, end = nbdp;
+  bool ok = true;
+  for(int n = 0; n < 255; n++) {
+    uint8_t *dsc = enet_arm_mem(dram, nbdp, 12);
+    if(!dsc) {
+      ok = false;
+      break;
+    }
+    uint32_t bc   = hdma_be32(dsc + 4);
+    uint32_t next = hdma_be32(dsc + 8);
+    sum += bc & HPC3_BC_COUNT;
+    end = next;
+    if((bc & (HPC3_BC_EOXP | HPC3_BC_EOX)) && sum > pkt) {
+      if(sum > g_etx_len) {
+        ok = false;
+        break;
+      }
+      if(sum - pkt >= 14) {
+        ssize_t w = ::write(tap->fd, g_etx_buf + pkt, sum - pkt);
+        (void)w;
+      }
+      if(!(bc & HPC3_BC_EOXP)) {
+        /* torn chain: the packet ended on a bare EOX -- the guest was still building
+         * it when the engine walked (the host path deferred these, ENET_TX_INCOMPLETE) */
+        if(++g_ee_torn <= 20) {
+          fprintf(stderr, "[eneteng] TORN chain: desc 0x%08x bc 0x%08x pkt %u..%u txlen %u\n",
+                  nbdp, bc, pkt, sum, txlen);
+        }
+      }
+      g_ee_pkts++;
+      pkt = sum;
+    }
+    /* Stop where the ENGINE stopped, not where the chain ends now: IRIX appends to a
+     * chain (clearing the old tail's EOX) after the engine has already finished it,
+     * and walking on would publish a TX CRBDP past what was transmitted.  The engine
+     * always ends on a packet boundary with exactly txlen bytes. */
+    if((bc & HPC3_BC_EOX) || next == 0 ||
+       ((bc & HPC3_BC_EOXP) && sum == txlen)) {
+      break;
+    }
+    nbdp = next;
+  }
+  off = sum;
+  if(!ok || off != txlen || ((txlen + 15u) & ~15u) != g_etx_len) {
+    /* the walk disagrees with what the engine sent: say so, and send what the engine
+     * reported as one frame rather than nothing */
+    g_ee_badlen++;
+    fprintf(stderr, "[eneteng] TX len mismatch: desc sum %u engine %u beats %u ok %d\n",
+            off, txlen, g_etx_len, (int)ok);
+    if(pkt == 0 && txlen >= 14 && txlen <= g_etx_len) {
+      ssize_t w = ::write(tap->fd, g_etx_buf, txlen);
+      (void)w;
+    }
+  }
+  return end;
+}
+
+static inline uint64_t enet_now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static inline bool enet_arm_poll_engine(Driver *d, enet_tap *tap, uint8_t *dram) {
+  static uint32_t last_tx_seq = 0, last_arm_seq = 0, rx_rsp_seq = 0;
+  static bool rx_armed = false;
+  bool did_work = false;
+  /* IRIX's ec_watchdog resets the interface (an Oerr, and an RTO for TCP) when TX
+   * stays ACTIVE with no progress across a 2 s if_timer tick: log every service gap
+   * and every doorbell-to-echo latency that gets anywhere near that */
+  static uint64_t last_poll_ms = 0, tx_seen_ms = 0;
+  uint64_t now = enet_now_ms();
+  if(last_poll_ms != 0 && now - last_poll_ms > 500) {
+    fprintf(stderr, "[eneteng] poll gap %llu ms\n", (unsigned long long)(now - last_poll_ms));
+  }
+  last_poll_ms = now;
+
+  /* ---- TX: the engine already walks the chain on the guest's kick ---- */
+  uint32_t tx_seq = d->read32(ENET_R_TX_REQ_SEQ);
+  if(tx_seq != last_tx_seq) {
+    uint32_t nbdp = d->read32(ENET_R_TX_NBDP);
+    did_work = true;
+    if(tx_seen_ms == 0) {
+      tx_seen_ms = now;
+    }
+    if(enet_arm_collect_tx(d)) {
+      uint32_t tx_end = enet_eng_emit(tap, dram, nbdp, g_etx_ready_len);
+      g_etx_len = 0;
+      g_etx_ready = false;
+      d->write32(ENET_W_TX_CRBDP, tx_end);       /* reap bound, before the echo */
+      last_tx_seq = tx_seq;
+      __sync_synchronize();
+      d->write32(ENET_W_TX_RSP_SEQ, tx_seq);     /* echo -> shim clears ACTIVE + TX IRQ */
+      if(enet_now_ms() - tx_seen_ms > 500) {
+        fprintf(stderr, "[eneteng] TX latency %llu ms (txlen %u)\n",
+                (unsigned long long)(enet_now_ms() - tx_seen_ms), g_etx_ready_len);
+      }
+      tx_seen_ms = 0;
+      if((++g_ee_chains & 1023u) == 0) {
+        enet_eng_stats();
+      }
+    }
+  }
+
+  /* ---- RX: the RTL tracks the ring position itself; just wait for the first arm ---- */
+  uint32_t arm_seq = d->read32(ENET_R_RX_ARM_SEQ);
+  if(arm_seq != last_arm_seq) {
+    last_arm_seq = arm_seq;
+    rx_armed = true;
+  }
+  if(rx_armed) {
+    uint8_t fr[ENET_FRAME_MAX];
+    static uint8_t rxb[ENET_FRAME_MAX + 3];
+    for(int k = 0; k < 8; k++) {
+      ssize_t n = ::read(tap->fd, fr, sizeof(fr));
+      if(n < 14) {
+        break;
+      }
+      bool is_bcast = (fr[0]&fr[1]&fr[2]&fr[3]&fr[4]&fr[5]) == 0xff;
+      if((fr[0] & 1) && !is_bcast) {
+        continue;                                 /* stray multicast -> drop, as the host path */
+      }
+      rxb[0] = 0;
+      rxb[1] = 0;                                 /* 2-byte pad */
+      memcpy(rxb + 2, fr, (size_t)n);
+      rxb[2 + n] = ENET_RX_STATUS_GOOD;           /* appended Seeq status */
+      if(enet_arm_push_frame(d, rxb, (uint32_t)n + 3)) {
+        d->write32(ENET_W_RX_CRBDP, d->read32(ENET_R_CRBDP));   /* guest reads it at HPC3 0x18000 */
+        d->write32(ENET_W_RX_RSP_SEQ, ++rx_rsp_seq);              /* -> shim raises RX IRQ */
+        g_ee_rx++;
+        did_work = true;
+      }
+      else {
+        g_ee_rxdrop++;                            /* ring full (or wedged): drop, like HW */
+      }
+    }
+  }
+  return did_work;
+}
+
 static inline bool enet_arm_poll(Driver *d, enet_tap *tap, uint8_t *dram) {
   g_dma_drv = d;                                  /* DMALOG sync records read the cycle counter */
   if(!tap->ok()) { return false; }
+  if(g_enetengine) {
+    return enet_arm_poll_engine(d, tap, dram);
+  }
   static uint32_t last_tx_seq = 0, last_arm_seq = 0, rx_rsp_seq = 0, rx_nbdp = 0;
   bool did_work = false;
 

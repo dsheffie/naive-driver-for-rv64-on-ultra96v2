@@ -20,6 +20,7 @@
 #include <termios.h>
 #include "scsi_arm.h"
 #include "enet_arm.h"
+#include "ring_service.h"
 
 #include <iostream>
 #include <fstream>
@@ -96,6 +97,44 @@ inline double timestamp() {
 }
 
 static Driver *d = nullptr;
+
+/* ENETRINGS=1: ENET through the staging rings (docs/arm-device-protocol.md) -- needs a
+ * bit built with ENET_RINGS.  The ARM never touches guest memory on this path. */
+static const bool g_enetrings = getenv("ENETRINGS") != nullptr;
+static enet_ring_t g_ering;
+static bool enet_service(void) {
+  if(!g_enetrings) {
+    return enet_arm_poll(d, &g_enet_tap, c_addr);
+  }
+  bool did = enet_ring_tx_poll(&g_ering, g_enet_tap.ok() ? g_enet_tap.fd : -1) != 0;
+  if(g_enet_tap.ok()) {
+    uint8_t fr[ENET_FRAME_MAX];
+    for(int k = 0; k < 8; k++) {
+      ssize_t n = ::read(g_enet_tap.fd, fr, sizeof(fr));
+      if(n < 14) {
+        break;
+      }
+      /* the Seeq's own address filter is not visible to the PS: drop stray
+       * non-broadcast multicast, exactly as the host-served path does */
+      bool is_bcast = (fr[0]&fr[1]&fr[2]&fr[3]&fr[4]&fr[5]) == 0xff;
+      if((fr[0] & 1) && !is_bcast) {
+        continue;
+      }
+      enet_ring_rx_push(&g_ering, fr, (uint32_t)n);
+      did = true;
+    }
+  }
+  static uint64_t polls = 0;
+  if((++polls & ((1u << 20) - 1)) == 0) {
+    fprintf(stderr, "[eneteng] rings: tx_pkts=%llu tx_bytes=%llu tx_trunc=%llu tx_tapfail=%llu rx_pkts=%llu rx_full=%llu rx_drops=%u ip=%llu ip_long=%llu ip_short=%llu\n",
+            (unsigned long long)g_ering.tx_pkts, (unsigned long long)g_ering.tx_bytes,
+            (unsigned long long)g_ering.tx_trunc, (unsigned long long)g_ering.tx_tapfail,
+            (unsigned long long)g_ering.rx_pkts, (unsigned long long)g_ering.rx_full,
+            enet_ring_rx_drops(&g_ering), (unsigned long long)g_ering.tx_ip,
+            (unsigned long long)g_ering.tx_ip_long, (unsigned long long)g_ering.tx_ip_short);
+  }
+  return did;
+}
 
 static inline void report_status() {}
 
@@ -607,6 +646,47 @@ int main(int argc, char *argv[]) {
   d->write32(CONTROL_REG, 0);
   d->write32(4, 1);
   d->write32(4, 0);
+  if(g_enetrings) {
+    /* staging rings (docs/arm-device-protocol.md): the engine's indices just reset
+     * with the core, so zero ours to match before the core runs */
+    ring_io_t io;
+    io.stg = c_addr + RING_STG_PA;
+    io.doorbell = [](void *, uint32_t reg, uint32_t v) { d->write32(reg, v); };
+    io.ctx = nullptr;
+    enet_ring_init(&g_ering, io);
+    printf("[eneteng] staging rings at window offset 0x%08x\n", RING_STG_PA);
+    g_ering.tx_trace = getenv("ENETTRACE") != nullptr;   /* bit built with ENET_RING_TRACE */
+    if(getenv("ENETDIAG")) {
+      /* DEBUG ONLY: on a malformed TX frame, dump the guest descriptor chain it came
+       * from -- the one place this path reads guest memory, and only to diagnose */
+      g_ering.tx_diag = [](uint32_t first, uint32_t len, uint32_t want) {
+        uint32_t a = first;
+        for(int k = 0; k < 6 && a; k++) {
+          uint8_t *dd = enet_arm_mem(c_addr, a, 16);
+          if(!dd) {
+            break;
+          }
+          uint32_t bp = hdma_be32(dd + 0), bc = hdma_be32(dd + 4), dp = hdma_be32(dd + 8), w3 = hdma_be32(dd + 12);
+          fprintf(stderr, "[ering]   desc %08x bp %08x bc %08x (cnt %u%s%s%s%s) dp %08x w3 %08x\n",
+                  a, bp, bc, bc & 0x3fff, (bc & 0x80000000u) ? " EOX" : "", (bc & 0x40000000u) ? " EOXP" : "",
+                  (bc & 0x01000000u) ? " XIU" : "", (bc & 0x8000u) ? " ETXD" : "", dp, w3);
+          if(bc & 0x80000000u) {
+            break;
+          }
+          a = dp;
+        }
+        (void)len; (void)want;
+      };
+    }
+  }
+  if(g_scsirings) {
+    ring_io_t io;
+    io.stg = c_addr + RING_STG_PA;
+    io.doorbell = [](void *, uint32_t reg, uint32_t v) { d->write32(reg, v); };
+    io.ctx = nullptr;
+    scsi_ring_init(&g_sring, io);
+    printf("[scsiring] staging rings at window offset 0x%08x\n", RING_STG_PA);
+  }
   if(sgi_mode) {
     d->write32(0xc,1);
     pc = 0xbfc00000;
@@ -654,6 +734,8 @@ int main(int argc, char *argv[]) {
   /* --- ENET tap service (PS side); host end is tap0 = 192.168.7.1/24 --- */
 
   { const char* et = getenv("ENETTAP"); g_enet_tap.open_tap(et ? et : "tap0"); }   /* absent tap => ENET idle (poll no-ops) */
+  /* keep ENET serviced while a SCSIENGINE command spins (see scsi_arm.h g_scsi_idle_hook) */
+  g_scsi_idle_hook = []() { enet_service(); };   /* d, c_addr, g_enet_tap: file statics */
 
   { const char* mp = getenv("MONPORT"); mon_init(d, mp ? atoi(mp) : 2323); }
 
@@ -1187,7 +1269,7 @@ int main(int argc, char *argv[]) {
       pump_stdin_to_rx();
       
       const bool scsi_serviced = scsi_arm_poll(d, &g_scsi_disk, c_addr);
-      const bool enet_serviced = enet_arm_poll(d, &g_enet_tap, c_addr);   /* bridge the ENET mailbox <-> tap0 */
+      const bool enet_serviced = enet_service();   /* bridge the ENET mailbox <-> tap0 */
 #ifdef CLAUDE_DEBUG
       if(scsi_serviced){
         static const bool g_pctrace = getenv("PCTRACE") != nullptr;
