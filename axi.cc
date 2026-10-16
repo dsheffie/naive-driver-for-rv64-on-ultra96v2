@@ -19,7 +19,7 @@
 #include <fcntl.h>
 #include <termios.h>
 #include "scsi_arm.h"
-#include "enet_arm.h"
+#include "enet_service.h"
 #include "ring_service.h"
 
 #include <iostream>
@@ -98,14 +98,10 @@ inline double timestamp() {
 
 static Driver *d = nullptr;
 
-/* ENETRINGS=1: ENET through the staging rings (docs/arm-device-protocol.md) -- needs a
- * bit built with ENET_RINGS.  The ARM never touches guest memory on this path. */
-static const bool g_enetrings = getenv("ENETRINGS") != nullptr;
+/* ENET through the staging rings (henry docs/arm-device-protocol.md): the RTL engine
+ * walks the guest rings; the ARM only moves frames between staging and the tap. */
 static enet_ring_t g_ering;
 static bool enet_service(void) {
-  if(!g_enetrings) {
-    return enet_arm_poll(d, &g_enet_tap, c_addr);
-  }
   bool did = enet_ring_tx_poll(&g_ering, g_enet_tap.ok() ? g_enet_tap.fd : -1) != 0;
   if(g_enet_tap.ok()) {
     uint8_t fr[ENET_FRAME_MAX];
@@ -214,8 +210,8 @@ static void restore_tty() {
  * arms a prompt and the NEXT keystroke answers it.
  *
  * The prompt deliberately does NOT block.  The poll slot that calls the pump is
- * the same one that services the SCSI and ENET mailboxes (scsi_arm_poll /
- * enet_arm_poll, a few lines below the pump call), so blocking on the answer
+ * the same one that services SCSI and ENET (scsi_arm_poll /
+ * enet_service, a few lines below the pump call), so blocking on the answer
  * would stall the disk and the tap bridge for as long as the operator dithers.
  * Instead the confirm is a STATE: keep looping, keep servicing, and merely route
  * stdin to the answer instead of to the guest Rx FIFO until it resolves.  That
@@ -646,7 +642,16 @@ int main(int argc, char *argv[]) {
   d->write32(CONTROL_REG, 0);
   d->write32(4, 1);
   d->write32(4, 0);
-  if(g_enetrings) {
+  {
+    uint32_t rev = d->read32(SCSI_R_RTLREV);
+    if(rev != HENRY_RTL_REV) {
+      fprintf(stderr, "RTL revision 0x%08x, this driver needs 0x%08x (staging rings only)\n",
+              rev, HENRY_RTL_REV);
+      return -1;
+    }
+    printf("[rtl] revision = %08x\n", rev);
+  }
+  {
     /* staging rings (docs/arm-device-protocol.md): the engine's indices just reset
      * with the core, so zero ours to match before the core runs */
     ring_io_t io;
@@ -662,10 +667,10 @@ int main(int argc, char *argv[]) {
       g_ering.tx_diag = [](uint32_t first, uint32_t len, uint32_t want) {
         uint32_t a = first;
         for(int k = 0; k < 6 && a; k++) {
-          uint8_t *dd = enet_arm_mem(c_addr, a, 16);
-          if(!dd) {
+          if(a < 0x08000000u || a > 0x17fffff0u) {
             break;
           }
+          uint8_t *dd = c_addr + (a & 0x0fffffffu);   /* 256 MB Low Local Mem fold (M00_AXI) */
           uint32_t bp = hdma_be32(dd + 0), bc = hdma_be32(dd + 4), dp = hdma_be32(dd + 8), w3 = hdma_be32(dd + 12);
           fprintf(stderr, "[ering]   desc %08x bp %08x bc %08x (cnt %u%s%s%s%s) dp %08x w3 %08x\n",
                   a, bp, bc, bc & 0x3fff, (bc & 0x80000000u) ? " EOX" : "", (bc & 0x40000000u) ? " EOXP" : "",
@@ -679,7 +684,7 @@ int main(int argc, char *argv[]) {
       };
     }
   }
-  if(g_scsirings) {
+  {
     ring_io_t io;
     io.stg = c_addr + RING_STG_PA;
     io.doorbell = [](void *, uint32_t reg, uint32_t v) { d->write32(reg, v); };
@@ -710,7 +715,6 @@ int main(int argc, char *argv[]) {
   g_l2nc = getenv("L2_NOCACHE") ? (1u<<20) : 0u;
   g_deeptrace = getenv("TRACE_DEEP") ? (1u<<21) : 0u;
   if(g_deeptrace) printf("### TRACE_DEEP=1: DRAM control-flow deep trace armed (ctrl bit21, ring @0x18000000)\n"), std::fflush(nullptr);
-  printf("### RTL build-rev = 0x%08x (expect 0x20260727 = deep-trace)\n", d->read32(0x3f)), std::fflush(nullptr);
   if(g_l2nc) printf("### L2_NOCACHE=1: L2 behaves as no-cache (ctrl bit20 set before go)\n"), std::fflush(nullptr);
   uint32_t cr = (single_step ? (8 | 2 | STEP) : (8 | 2)) | g_l2nc | g_deeptrace;
   d->write32(4, cr);
@@ -729,12 +733,11 @@ int main(int argc, char *argv[]) {
   { const char* e = getenv("SELDELAY"); int sd = e ? atoi(e) : 65535;
     d->write32(SCSI_W_SELDELAY, (uint32_t)sd);
     printf("[rtl] SELDELAY set to %d\n", sd); }
-  printf("[rtl] revision = %08x (expect 20260721)\n", d->read32(SCSI_R_RTLREV));
 
   /* --- ENET tap service (PS side); host end is tap0 = 192.168.7.1/24 --- */
 
   { const char* et = getenv("ENETTAP"); g_enet_tap.open_tap(et ? et : "tap0"); }   /* absent tap => ENET idle (poll no-ops) */
-  /* keep ENET serviced while a SCSIENGINE command spins (see scsi_arm.h g_scsi_idle_hook) */
+  /* keep ENET serviced while a SCSI chain's completion is awaited (scsi_arm.h g_scsi_idle_hook) */
   g_scsi_idle_hook = []() { enet_service(); };   /* d, c_addr, g_enet_tap: file statics */
 
   { const char* mp = getenv("MONPORT"); mon_init(d, mp ? atoi(mp) : 2323); }
@@ -991,20 +994,6 @@ int main(int argc, char *argv[]) {
               fprintf(stderr,"### STACK DRAM sp=%08x -> pa=%08x:", sp, pab);
               for(uint32_t off=0; off<0x120u; off+=4){ fprintf(stderr," +%x=%08x", off, rdbe(pab+off)); }
               fprintf(stderr,"\n");
-              /* CROSS-CHECK (complete history via per-page bitmap): was the poison's physical page
-               * EVER a SCSI DMA (disk->DRAM) target? (page-reuse + stale-L1 hypothesis).  Check the
-               * stack page +- 1 neighbor. */
-              int hitpg = -2;
-              for(int pg = -1; pg <= 1 && hitpg < -1; pg++){
-                uint32_t ppage = (pab & ~0xfffu) + (uint32_t)(pg*0x1000);
-                if(scsi_dma_page_seen(ppage)) hitpg = pg;
-              }
-              if(hitpg >= -1)
-                fprintf(stderr,"### *** POISON-PAGE WAS SCSI-DMA'd (page %+d of stack pa=%08x) -- page-reuse+stale-cache CANDIDATE (of %u total DMA ranges) ***\n",
-                        hitpg, pab, g_scsi_dma_n);
-              else
-                fprintf(stderr,"### poison page %08x + neighbors NEVER SCSI-DMA'd (of %u total ranges) -- DMA-reuse hypothesis RULED OUT for this crash\n",
-                        pab & ~0xfffu, g_scsi_dma_n);
             } else fprintf(stderr,"### STACK: no valid TLB entry for sp=%08x vpn2=%x\n", sp, vpn2);
             fflush(stderr);
           }
@@ -1268,8 +1257,8 @@ int main(int argc, char *argv[]) {
       total_us += us_amt;
       pump_stdin_to_rx();
       
-      const bool scsi_serviced = scsi_arm_poll(d, &g_scsi_disk, c_addr);
-      const bool enet_serviced = enet_service();   /* bridge the ENET mailbox <-> tap0 */
+      const bool scsi_serviced = scsi_arm_poll(d, &g_scsi_disk);
+      const bool enet_serviced = enet_service();   /* ENET staging rings <-> tap0 */
 #ifdef CLAUDE_DEBUG
       if(scsi_serviced){
         static const bool g_pctrace = getenv("PCTRACE") != nullptr;
