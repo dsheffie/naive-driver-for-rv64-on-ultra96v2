@@ -21,6 +21,7 @@
 #include "scsi_arm.h"
 #include "enet_service.h"
 #include "ring_service.h"
+#include "newport_arm.hh"
 
 #include <iostream>
 #include <fstream>
@@ -300,7 +301,9 @@ bool cmdline(int argc,
 	     std::string &cimg_name,
 	     std::string &disk_name,
 	     std::string &rom_image,
-	     std::string &rom_pa);
+	     std::string &rom_pa,
+	     std::string &newport_display,
+	     int &newport_cpu);
 
 // Silicon checkpoint resume: replicate henry_tb's fpga_map so cimg pages land in DRAM
 // exactly where the core (via the AXI master's IP22 fold) will read them.
@@ -468,10 +471,12 @@ int main(int argc, char *argv[]) {
   std::string rom_image, rom_pa_s;
   std::string start_pc;
   std::string cimg_name, disk_name;
+  std::string newport_display;
+  int newport_cpu = 3;
   rvstatus rs(0);
   /* --- SCSI disk service (PS side) --- */
 
-  if(not(cmdline(argc, argv, initialize, silent, chpt_name, max_fetches, max_iters, sgi_mode, single_step, arcs_image, start_pc, cimg_name, disk_name, rom_image, rom_pa_s))) {
+  if(not(cmdline(argc, argv, initialize, silent, chpt_name, max_fetches, max_iters, sgi_mode, single_step, arcs_image, start_pc, cimg_name, disk_name, rom_image, rom_pa_s, newport_display, newport_cpu))) {
     return -1;
   }
 
@@ -692,6 +697,8 @@ int main(int argc, char *argv[]) {
     scsi_ring_init(&g_sring, io);
     printf("[scsiring] staging rings at window offset 0x%08x\n", RING_STG_PA);
   }
+  /* the GIO window holds every load to it until answered: serve it before the core runs */
+  newport_arm_start(d, c_addr + RING_STG_PA, newport_display.c_str(), newport_cpu);
   if(sgi_mode) {
     d->write32(0xc,1);
     pc = 0xbfc00000;
@@ -1399,6 +1406,7 @@ int main(int argc, char *argv[]) {
     }
   }
  
+  newport_arm_stop();
   munmap(c_addr, memsize);
   stopCapstone();
   return 0;

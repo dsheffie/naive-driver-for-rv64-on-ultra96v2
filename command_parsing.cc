@@ -17,7 +17,9 @@ bool cmdline(int argc,
 	     std::string &cimg_name,
 	     std::string &disk_name,
 	     std::string &rom_image,
-	     std::string &rom_pa) {
+	     std::string &rom_pa,
+	     std::string &newport_display,
+	     int &newport_cpu) {
   
   namespace po = boost::program_options;
   po::options_description desc("Options");  
@@ -36,11 +38,18 @@ bool cmdline(int argc,
     ("disk", po::value<std::string>(&disk_name)->default_value("/home/root/irix65-clean.img"), "disk image")
       ("rom", po::value<std::string>(&rom_image)->default_value(""), "filesystem image preloaded into DRAM for the hcart block device (no DMA); empty = none")
       ("rom-pa", po::value<std::string>(&rom_pa)->default_value("0x0c000000"), "MIPS physical address for --rom; must sit above the RAM the kernel is told about")
+    ("newport-display", po::value<std::string>(&newport_display)->default_value(""), "X display for the Newport window, e.g. :2 (empty = headless)")
+    ("newport-cpu", po::value<int>(&newport_cpu)->default_value(3), "A53 core for the GIO-window service thread (-1 = unpinned)")
     ;
   try {
     po::variables_map vm;
     po::store(po::parse_command_line(argc, argv, desc), vm);
     po::notify(vm); 
+    if(vm.count("help")) {
+      /* without this, --help fell through and RAN: zeroed DRAM and reset a live core */
+      std::cout << desc << "\n";
+      return false;
+    }
   }
   catch(po::error &e) {
     std::cerr << "command-line error : " << e.what() << "\n";
