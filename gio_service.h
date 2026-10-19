@@ -7,7 +7,8 @@
  * window into a 16-byte record in the capture ring; this drains the ring in order into
  * a device model and answers READ records, which the PL holds the CPU load for.
  *
- * Record (LE): w0 = {type[31:30] (0 STORE, 1 READ), mask[29:22], dwoff[21:0]}; dwoff[21]
+ * Record (LE): w0 = {type[31:30] (0 STORE, 1 READ, 2 VDMA STORE, 3 VDMA MARKER),
+ * mask[29:22], dwoff[21:0]}; dwoff[21]
  * = space (0 the Newport window, 1 the IOC2 8042 keyboard/mouse controller -> dev2),
  * recno (1, 2, 3, ...), lane[0..7] = the bytes at window offset dwoff*8 + i.  Record n
  * lives in slot (n-1) mod 65536; prod (= recno of the last record written) is at
@@ -17,7 +18,13 @@
  * valid byte, size 1/2/4/8, and the value "in guest memory order", i.e. the bytes in
  * address order loaded little-endian (the CPU path byte-swaps).  A mask that is not
  * one naturally aligned 1/2/4/8-byte access (lwl/swr-style partials) is split into
- * single bytes. */
+ * single bytes.
+ *
+ * MC VDMA (memory -> GIO): the PL brackets each transfer's doublewords (type 2) with a
+ * BEGIN and an END marker (type 3, mask bit 0 = BEGIN).  The CPU keeps running during
+ * the transfer, so CPU records can fall between the markers; we treat them as REX3 does
+ * while a host-data DMA owns it: the device is told (dev.dma) so it reports busy to
+ * reads, and the CPU's stores to it are held and applied after END, in order. */
 #include <cstdint>
 #include <cstdio>
 #include "ring_service.h"
@@ -34,7 +41,14 @@ struct gio_dev_t {
   void *ctx;
   void (*write)(void *ctx, uint32_t off, uint64_t v, uint32_t sz);
   uint64_t (*read)(void *ctx, uint32_t off, uint32_t sz);
+  void (*dma)(void *ctx, bool on);   /* a VDMA transfer starts / ends (may be null) */
 };
+
+struct gio_held_t {
+  uint32_t w0;
+  uint64_t lanes;
+};
+static const uint32_t GIO_HELD_N = 8192;   /* CPU stores held during one VDMA transfer */
 
 struct gio_svc_t {
   ring_io_t io;
@@ -43,6 +57,13 @@ struct gio_svc_t {
   uint32_t cons;             /* ARM-owned: records consumed */
   uint32_t irq;              /* last IRQ level doorbelled */
   uint64_t stores, reads, split, bad_recno;
+  uint64_t dma_stores, dma_xfers, held_stores, held_overflow;
+  bool in_dma;
+  bool no_hold;              /* debug: apply CPU stores at once even during a transfer */
+  bool log;                  /* debug: one line per VDMA transfer + the CPU reads inside it */
+  uint32_t xfer_dws, xfer_reads;
+  uint32_t nheld;
+  gio_held_t held[GIO_HELD_N];
 };
 
 static inline void gio_init(gio_svc_t *g, ring_io_t io, gio_dev_t dev, gio_dev_t dev2) {
@@ -114,11 +135,59 @@ static inline uint32_t gio_poll(gio_svc_t *g) {
         fprintf(stderr, "[gio] slot %u: recno %u, expected %u (w0 %08x)\n", g->cons % GIO_N, recno, g->cons + 1, w0);
       }
     }
-    const bool rd = (w0 >> 30) == 1;
+    const uint32_t type = w0 >> 30;
+    const bool rd = type == 1;
     const gio_dev_t &dev = ((w0 >> 21) & 1) ? g->dev2 : g->dev;
-    const uint64_t ans = gio_access(g, dev, rd, w0 & 0x1fffffu, (w0 >> 22) & 0xffu, lanes);
     g->cons++;
     n++;
+    if(type == 3) {
+      if((w0 >> 22) & 1) {
+        g->in_dma = true;
+        g->dma_xfers++;
+        g->xfer_dws = 0;
+        g->xfer_reads = 0;
+      }
+      else {
+        g->in_dma = false;
+        if(g->log) {
+          fprintf(stderr, "[vdma] xfer %llu: %u doublewords, %u CPU reads and %u CPU stores inside\n",
+                  (unsigned long long)g->dma_xfers, g->xfer_dws, g->xfer_reads, g->nheld);
+        }
+        for(uint32_t i = 0; i < g->nheld; i++) {
+          gio_access(g, g->dev, false, g->held[i].w0 & 0x1fffffu, (g->held[i].w0 >> 22) & 0xffu, g->held[i].lanes);
+        }
+        g->nheld = 0;
+      }
+      if(g->dev.dma) {
+        g->dev.dma(g->dev.ctx, g->in_dma);
+      }
+      continue;
+    }
+    if(type == 2) {
+      gio_access(g, g->dev, false, w0 & 0x1fffffu, (w0 >> 22) & 0xffu, lanes);
+      g->dma_stores++;
+      g->xfer_dws++;
+      continue;
+    }
+    if(g->in_dma && !g->no_hold && !rd && !((w0 >> 21) & 1)) {
+      if(g->nheld < GIO_HELD_N) {
+        g->held[g->nheld].w0 = w0;
+        g->held[g->nheld].lanes = lanes;
+        g->nheld++;
+        g->held_stores++;
+        g->stores++;
+        continue;
+      }
+      g->held_overflow++;     /* out of room: apply it now */
+    }
+    const uint64_t ans = gio_access(g, dev, rd, w0 & 0x1fffffu, (w0 >> 22) & 0xffu, lanes);
+    if(g->in_dma && rd) {
+      g->xfer_reads++;
+      if(g->log && g->xfer_reads <= 4) {
+        fprintf(stderr, "[vdma]   read off %04x mask %02x -> %016llx\n", (w0 & 0x1fffffu) * 8,
+                (w0 >> 22) & 0xffu, (unsigned long long)ans);
+      }
+    }
     if(rd) {
       /* the load is held until the sequence lands: lanes first, sequence last */
       g->reads++;

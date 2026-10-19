@@ -187,11 +187,24 @@ private:
     return *rb.ptr >> rb.src_shift;
   }
   void rb_write(uint32_t v);
+  /* the bits a plane target owns in its buffer word: RB2 aux per byte is CID [1:0],
+   * popup [3:2], CID [5:4], popup [7:6], overlay bytes [15:8] and [23:16].  A popup
+   * write is replicated across lanes like any 8-bit write, so without this its copies
+   * land in the overlay byte (a black overlay bar over a window). */
+  uint32_t plane_mask() const {
+    switch(rb.plane_enable)
+      {
+      case 4: return 0x00ffff00u;
+      case 5: return 0x000000ccu;
+      case 6: return 0x00000033u;
+      default: return 0x00ffffffu;
+      }
+  }
   void rb_store(uint32_t v) {
     if(touching) {
       touch_note(rb.ptr);
     }
-    const uint32_t m = rb.write_mask & rb.global_mask;
+    const uint32_t m = rb.write_mask & rb.global_mask & plane_mask();
     *rb.ptr = (*rb.ptr & ~m) | (v & m);
   }
   /* rex3 drawing */

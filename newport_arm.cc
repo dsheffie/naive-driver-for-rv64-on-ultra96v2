@@ -44,6 +44,7 @@ static const uint64_t VBLANK_PERIOD = 100000000ull / 60;   /* 60 Hz */
 static const uint64_t IDLE_SPIN = 100000;                  /* 1 ms of empty polls, then back off */
 static const long IDLE_SLEEP_NS = 20000;
 static const long FRAME_NS = 40000000;                     /* X11 window: 25 Hz */
+static const int EDGE_PUSH = 64;                           /* pointer edge re-sync (pixels) */
 
 static Driver *g_d = nullptr;
 static sgi_newport *g_np = nullptr;
@@ -197,6 +198,21 @@ static void x11_main(std::string disp) {
         }
         last_x = e.xmotion.x;
         last_y = e.xmotion.y;
+        /* edge re-sync: the guest cursor stops at the screen edge while ours may keep
+         * going, which leaves a lasting offset; at our edge, push the guest past its
+         * edge too so both are clamped to the same place */
+        if(last_x <= 0) {
+          acc_dx -= EDGE_PUSH;
+        }
+        else if(last_x >= w - 1) {
+          acc_dx += EDGE_PUSH;
+        }
+        if(last_y <= 0) {
+          acc_dy -= EDGE_PUSH;
+        }
+        else if(last_y >= h - 1) {
+          acc_dy += EDGE_PUSH;
+        }
       }
       else if(e.type == ButtonPress || e.type == ButtonRelease) {
         /* X 1/2/3 = left/middle/right -> PS/2 bits 0x01 / 0x04 / 0x02 */
@@ -265,12 +281,25 @@ void newport_arm_start(Driver *d, uint8_t *stg, const char *display, int cpu) {
   dev.ctx = g_np;
   dev.write = [](void *ctx, uint32_t off, uint64_t v, uint32_t sz) { static_cast<sgi_newport *>(ctx)->write(off, v, sz); };
   dev.read = [](void *ctx, uint32_t off, uint32_t sz) -> uint64_t { return static_cast<sgi_newport *>(ctx)->read(off, sz); };
+  /* debug knobs, read once: NP_NO_GFXBUSY=1 REX3 never reports busy during a VDMA
+   * transfer; NP_NO_HOLD=1 CPU stores inside a transfer apply at once; NP_VDMA_LOG=1 a
+   * line per transfer (gio_service.h) */
+  static const bool g_no_gfxbusy = getenv("NP_NO_GFXBUSY") != nullptr;
+  dev.dma = nullptr;
+  if(!g_no_gfxbusy) {
+    dev.dma = [](void *ctx, bool on) { static_cast<sgi_newport *>(ctx)->set_in_dma(on); };
+  }
   gio_dev_t dev2;
   dev2.ctx = g_ps2;
+  dev2.dma = nullptr;
   /* 8042: data at byte +3 (0x1fbd9843), command/status at +7 (0x1fbd9847) */
   dev2.write = [](void *ctx, uint32_t off, uint64_t v, uint32_t) { static_cast<sgi_ps2 *>(ctx)->write(((off >> 2) & 1) != 0, (uint8_t)v); };
   dev2.read = [](void *ctx, uint32_t off, uint32_t) -> uint64_t { return static_cast<sgi_ps2 *>(ctx)->read(((off >> 2) & 1) != 0); };
   gio_init(&g_gio, io, dev, dev2);
+  g_gio.no_hold = getenv("NP_NO_HOLD") != nullptr;
+  g_gio.log = getenv("NP_VDMA_LOG") != nullptr;
+  fprintf(stderr, "[newport] VDMA: REX3 busy during transfers %s, CPU stores held %s, log %s\n",
+          g_no_gfxbusy ? "OFF" : "on", g_gio.no_hold ? "OFF" : "on", g_gio.log ? "on" : "off");
   g_svc_thread = new std::thread(svc_main);
   if(cpu >= 0) {
     cpu_set_t set;

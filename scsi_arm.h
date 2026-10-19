@@ -46,7 +46,7 @@ enum {
   SCSI_W_RSP_SEQ  = 0x0D, SCSI_W_RESID = 0x0F, SCSI_W_STATUS = 0x10, SCSI_W_SELDELAY = 0x11,
 };
 /* the RTL revision this driver speaks to: staging rings only, no beat conduit */
-static const uint32_t HENRY_RTL_REV = 0x20261017u;   /* + 8042 via the gio ring, bbRAM in DRAM */
+static const uint32_t HENRY_RTL_REV = 0x20261018u;   /* + MC VDMA records (types 2/3) in the gio ring */
 
 /* Called while waiting for a chain's completion so a long disk burst does not starve
  * the rest of the main loop -- ENET in particular: servicing a SCSI command to

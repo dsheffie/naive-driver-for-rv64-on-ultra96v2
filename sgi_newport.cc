@@ -6,7 +6,8 @@
  * copyright Ryan Holtz): REX3 register file + drawing engine, the DCB slaves
  * (VC2, XMAP9 x2, CMAP x2, Bt445 RAMDAC) and the RB2 framebuffer.  Like MAME,
  * every draw completes instantly and the GFIFO/BFIFO always read empty, so
- * STATUS never shows GFXBUSY/BACKBUSY.
+ * STATUS shows GFXBUSY only while an MC VDMA transfer's host data is still arriving
+ * (set_in_dma), and BACKBUSY only for the DCB timeout below.
  *
  * REX3 is a 64-bit device: MAME's rex3_r/rex3_w take the 8-byte line plus which
  * 32-bit half is touched (big-endian: bits 63:32 live at line+0, 31:0 at
@@ -60,6 +61,7 @@ enum {
   DCB_XMAP0 = 5, DCB_XMAP1 = 6, DCB_RAMDAC = 7, DCB_CC1 = 8, DCB_AB1 = 9, DCB_PCD = 12
 };
 enum {
+  STATUS_GFXBUSY = (1u << 3),
   STATUS_BACKBUSY = (1u << 4),
   STATUS_VRINT = (1u << 5)
 };
@@ -676,6 +678,9 @@ uint64_t sgi_newport::rex3_r(uint32_t line, bool hi, bool lo) {
       }
       if(hi) {                                 /* STATUS: read acknowledges retrace */
         h = rex.status | 3;                    /* | 3 = REX3 version bits, as MAME */
+        if(in_dma) {
+          h |= STATUS_GFXBUSY;                 /* a host-data DMA is still arriving */
+        }
         rex.status &= ~STATUS_VRINT;
         set_vrint(false);
       }
@@ -1137,7 +1142,22 @@ bool sgi_newport::clip_pass(int16_t x, int16_t y) {
       return false;
     }
   }
-  return !(x < 0 || y < 0 || x >= (int)FB_W || y >= (int)DISP_H);
+  if(x < 0 || y < 0 || x >= (int)FB_W || y >= (int)DISP_H) {
+    return false;
+  }
+  /* CLIPMODE[12:9] CIDMATCH: one bit per clip ID (the pixel's CID planes, aux bits
+   * [1:0]); a pixel is drawn only if its CID's bit is set.  The X server writes 0xf
+   * (all pass); a direct-rendering client (Twilight drawing the root, GL windows)
+   * writes one bit so it touches only the pixels its window owns.  MAME has no CID
+   * test, so a full-screen root draw ran over every window. */
+  const uint32_t cidmatch = (rex.clip_mode >> 9) & 0xf;
+  if(cidmatch != 0xf) {
+    const uint32_t cid = rb.cidaux[(uint32_t)(NP_ROW(y) * FB_W + x)] & 3;
+    if(!BITN(cidmatch, cid)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void sgi_newport::output_pixel(int16_t x, int16_t y, uint32_t color) {
@@ -1772,9 +1792,14 @@ bool sgi_newport::span_fast(int16_t &start_x, int16_t y, int16_t prim_end_x, int
   }
   const int x_min0 = m0 ? (int16_t)(rex.smask_x[0] >> 16) : -65536;
   const int x_max0 = m0 ? (int16_t)rex.smask_x[0] : 65536;
+  const uint32_t cidmatch = (rex.clip_mode >> 9) & 0xf;     /* as clip_pass */
+  const uint32_t *cidrow = &rb.cidaux[(uint32_t)NP_ROW(yw) * FB_W];
   for(int k = 0; k < n; k++) {
     const int x = x0 + k, xw = xw0 + k;
     bool ok = wr[k] && x >= x_min0 && x <= x_max0 && xw >= 0 && xw < (int)FB_W;
+    if(ok && cidmatch != 0xf) {
+      ok = BITN(cidmatch, cidrow[xw] & 3);
+    }
     if(any_m) {
       bool hit = false;
       for(int i = 0; i < nm; i++) {
@@ -1799,7 +1824,7 @@ bool sgi_newport::span_fast(int16_t &start_x, int16_t y, int16_t prim_end_x, int
       }
     }
   }
-  const uint32_t m = rb.write_mask & rb.global_mask;
+  const uint32_t m = rb.write_mask & rb.global_mask & plane_mask();
   const uint32_t op = rb.logicop;
   const uint32_t t0 = BITN(op, 0) ? ~0u : 0, t1 = BITN(op, 1) ? ~0u : 0;
   const uint32_t t2 = BITN(op, 2) ? ~0u : 0, t3 = BITN(op, 3) ? ~0u : 0;

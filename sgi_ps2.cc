@@ -275,6 +275,21 @@ bool sgi_ps2::key(const std::string &name, bool down) {
 }
 
 void sgi_ps2::mouse(int dx, int dy, uint8_t buttons) {
+  /* coalesce: motion with unchanged buttons folds into the newest packet not yet
+   * handed to the guest, so a slow guest handler never builds a backlog -- the cursor
+   * goes straight to where the host pointer is now instead of replaying the path */
+  if((buttons & 7) == mouse_buttons && !host_aux.empty() && host_aux.back().size() == 3) {
+    std::vector<uint8_t> &q = host_aux.back();
+    const int qx = (q[0] & 0x10) ? (int)q[1] - 256 : (int)q[1];
+    const int qy = -((q[0] & 0x20) ? (int)q[2] - 256 : (int)q[2]);   /* back to host +y down */
+    if((q[0] & 7) == mouse_buttons && qx + dx >= -255 && qx + dx <= 255 && qy + dy >= -255 && qy + dy <= 255) {
+      const int px = qx + dx, my = -(qy + dy);
+      q[0] = (uint8_t)(0x08 | mouse_buttons | (px < 0 ? 0x10 : 0) | (my < 0 ? 0x20 : 0));
+      q[1] = (uint8_t)px;
+      q[2] = (uint8_t)my;
+      return;
+    }
+  }
   mouse_buttons = buttons & 7;
   do {                                         /* split into packets of at most +-255 */
     const int px = dx > 255 ? 255 : (dx < -255 ? -255 : dx);
