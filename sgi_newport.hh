@@ -164,7 +164,7 @@ private:
   uint64_t next_vblank = 0;
   uint64_t vblank_period = 0;
   uint64_t nframes = 0;
-  uint64_t backbusy_until = 0;   /* DCB timeout (absent slave) clears BACKBUSY here */
+  uint32_t backbusy_reads = 0;   /* STATUS reads until an absent-slave DCB access clears BACKBUSY */
   bool in_dma = false;            /* accesses come from the MC graphics DMA engine */
   uint64_t go_pixels = 0;         /* pixels produced by the stepper (trace) */
   bool touching = false;

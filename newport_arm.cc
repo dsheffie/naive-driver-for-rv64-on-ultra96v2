@@ -8,10 +8,12 @@
  *
  * AXI-Lite from two threads: Driver::write32 is one 32-bit store to the register
  * window, i.e. one independent AXI-Lite write.  This thread writes only the GIO
- * registers (0x20-0x23, 0x2a) and reads none, so nothing it does can interleave
- * with a select-then-read sequence on the main thread (GPR readback 14/0xe, ...).
- * No lock. */
+ * registers (0x20-0x23, 0x2a) and reads only 0x21 (the held GIO load, a plain
+ * register with no select), so nothing it does can interleave with a select-then-read
+ * sequence on the main thread (GPR readback 14/0xe, ...).  No lock. */
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <atomic>
 #include <deque>
@@ -67,11 +69,54 @@ static std::atomic<bool> g_stop(false);
 static std::thread *g_svc_thread = nullptr, *g_x11_thread = nullptr;
 static uint64_t g_vblanks = 0, g_naps = 0, g_frames = 0, g_puts = 0;
 
+/* Idle back-off.  A READ holds the MIPS core until we answer it, so every nap that
+ * a READ lands in is pure core stall: Doom under Xsgi spent 6% of the core in the
+ * Newport ISR's REX3 STATUS load, 1-16 ms per load.  Three rules, all cheap:
+ *  - never nap while a device IRQ is asserted: the guest ISR's status READ is
+ *    microseconds away (the read is what drops VRINT);
+ *  - never nap past the next retrace: we raise it ourselves;
+ *  - the idle-spin window adapts: a READ seen right after we started napping means
+ *    we gave up too early, so double it; halve it after each quiet window.
+ * NP_SVC_FIXED=1 restores the old fixed 1 ms window, for A/B. */
+static const uint64_t SPIN_MIN = 10000, SPIN_MAX = 1000000;   /* 0.1 ms .. 10 ms */
+static const uint64_t STAT_PERIOD = 1000000000ull;            /* 10 s */
+
 static void svc_main() {
-  uint64_t last_busy = np_now();
+  static const bool fixed = getenv("NP_SVC_FIXED") != nullptr;
+  uint64_t last_busy = np_now(), spin = IDLE_SPIN, nap_start = 0;
+  /* READ service stats: polls that found a READ, and how stale that poll was */
+  uint64_t last_poll = last_busy, stat_at = last_busy + STAT_PERIOD;
+  uint64_t rd0 = 0, early0 = 0, rd_late = 0, gap_max = 0, naps0 = 0;
   while(!g_stop.load(std::memory_order_relaxed)) {
+    const uint64_t rd_before = g_gio.reads;
     const uint32_t n = gio_poll(&g_gio);
     const uint64_t t = np_now();
+    if(g_gio.reads != rd_before) {
+      const uint64_t gap = t - last_poll;
+      if(gap > 100000) {
+        rd_late++;                 /* the READ waited > 1 ms on us */
+      }
+      if(gap > gap_max) {
+        gap_max = gap;
+      }
+      if(!fixed && nap_start && (t - nap_start) < spin) {
+        spin = std::min(spin * 2, SPIN_MAX);
+      }
+      nap_start = 0;
+    }
+    last_poll = t;
+    if(t >= stat_at) {
+      fprintf(stderr, "[gio-svc] %llu reads (%llu early), %llu waited >1ms, worst poll gap %.2f ms, %llu naps, spin %.2f ms%s\n",
+              (unsigned long long)(g_gio.reads - rd0), (unsigned long long)(g_gio.early_reads - early0),
+              (unsigned long long)rd_late, gap_max / 1e5,
+              (unsigned long long)(g_naps - naps0), spin / 1e5, fixed ? " (fixed)" : "");
+      rd0 = g_gio.reads;
+      early0 = g_gio.early_reads;
+      naps0 = g_naps;
+      rd_late = 0;
+      gap_max = 0;
+      stat_at = t + STAT_PERIOD;
+    }
     if(t >= g_np->next_vblank_at()) {
       g_np->vblank(t);
       g_vblanks++;
@@ -93,10 +138,31 @@ static void svc_main() {
     if(n) {
       last_busy = t;               /* records pending or a load held: never sleep here */
     }
-    else if(t - last_busy > IDLE_SPIN) {
-      const struct timespec ts = { 0, IDLE_SLEEP_NS };
-      nanosleep(&ts, nullptr);
-      g_naps++;
+    else if(fixed) {
+      if(t - last_busy > IDLE_SPIN) {
+        const struct timespec ts = { 0, IDLE_SLEEP_NS };
+        nanosleep(&ts, nullptr);
+        g_naps++;
+      }
+    }
+    else if(g_gio.irq != 0) {
+      last_busy = t;               /* an ISR read is imminent */
+    }
+    else if(t - last_busy > spin) {
+      /* the nap must end before the next retrace (10 ns units -> ns, minus 50 us) */
+      const uint64_t to_vb = g_np->next_vblank_at() > t ? (g_np->next_vblank_at() - t) * 10 : 0;
+      if(to_vb > 50000 + IDLE_SLEEP_NS) {
+        if(!nap_start) {
+          nap_start = t;
+        }
+        const struct timespec ts = { 0, IDLE_SLEEP_NS };
+        nanosleep(&ts, nullptr);
+        g_naps++;
+      }
+      if(nap_start && (t - nap_start) > spin) {
+        spin = std::max(spin / 2, SPIN_MIN);   /* a quiet window: back off sooner */
+        nap_start = t;
+      }
     }
   }
 }
@@ -298,6 +364,10 @@ void newport_arm_start(Driver *d, uint8_t *stg, const char *display, int cpu) {
   gio_init(&g_gio, io, dev, dev2);
   g_gio.no_hold = getenv("NP_NO_HOLD") != nullptr;
   g_gio.log = getenv("NP_VDMA_LOG") != nullptr;
+  /* NP_NO_EARLY=1: answer REX3 STATUS reads in ring order too (gio_answer_early) */
+  if(getenv("NP_NO_EARLY") == nullptr) {
+    g_gio.held_rd = [](void *) -> uint32_t { return g_d->read32(GIO_RD_HELD); };
+  }
   fprintf(stderr, "[newport] VDMA: REX3 busy during transfers %s, CPU stores held %s, log %s\n",
           g_no_gfxbusy ? "OFF" : "on", g_gio.no_hold ? "OFF" : "on", g_gio.log ? "on" : "off");
   g_svc_thread = new std::thread(svc_main);

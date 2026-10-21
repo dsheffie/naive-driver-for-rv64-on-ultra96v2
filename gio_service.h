@@ -36,6 +36,12 @@ enum {
 static const uint32_t GIO_RING  = 0x200000;            /* staging offset of the capture ring */
 static const uint32_t GIO_N     = 65536;
 static const uint32_t GIO_PROD  = 0x00060;
+/* PS read 0x21: {held load pending, its recno[30:0]} -- the one GIO load the core waits on */
+static const uint32_t GIO_RD_HELD = 0x21;
+/* REX3 STATUS (window offset 0x1338, the high word of its doubleword): the only READ
+ * answered ahead of the records queued before it -- see gio_answer_early() */
+static const uint32_t GIO_STATUS_DWOFF = 0x1338 / 8, GIO_STATUS_MASK = 0x0f;
+static const uint32_t REX3_STATUS_GFXBUSY = 1u << 3;
 
 struct gio_dev_t {
   void *ctx;
@@ -56,6 +62,10 @@ struct gio_svc_t {
   gio_dev_t dev2;            /* space 1: the IOC2 8042 (offsets = the window's for 0x1fbd9840) */
   uint32_t cons;             /* ARM-owned: records consumed */
   uint32_t irq;              /* last IRQ level doorbelled */
+  uint32_t (*held_rd)(void *ctx);   /* PS read GIO_RD_HELD (null: never answer early) */
+  uint32_t early_seq;        /* recno of a READ already answered ahead of the drain, 0 none */
+  uint32_t early_no;         /* held recno already found not answerable early */
+  uint64_t early_reads;
   uint64_t stores, reads, split, bad_recno;
   uint64_t dma_stores, dma_xfers, held_stores, held_overflow;
   bool in_dma;
@@ -118,6 +128,58 @@ static inline uint64_t gio_access(gio_svc_t *g, const gio_dev_t &dev, bool rd, u
   return ans;
 }
 
+/* The Newport ISR reads REX3 STATUS on every retrace, and the core is held until we
+ * answer.  In order, that READ waits behind every record queued ahead of it -- under
+ * Doom 500-2100 VDMA doublewords at ~2.35 us each, i.e. 1-16 ms of core stall per
+ * retrace (6% of the core).  Of what STATUS returns, only GFXBUSY depends on those
+ * records: it is set while the READ sits inside a VDMA transfer.  So answer the held
+ * READ now if it is a STATUS read and the nearest VDMA marker before it (looking back
+ * at most GIO_EARLY_LOOKBACK records) is an END, with GFXBUSY clear; otherwise leave it
+ * in order, which is exact.  Never report a GFXBUSY REX3 would not: IRIX polls STATUS
+ * until it clears, and a spurious busy turned one read per retrace into ~3000/s.
+ * Every other READ stays in order. */
+static const uint32_t GIO_EARLY_LOOKBACK = 32;
+static inline void gio_answer_early(gio_svc_t *g, uint32_t prod) {
+  const uint32_t p = g->held_rd(g->io.ctx);
+  if(!(p >> 31)) {
+    return;
+  }
+  const uint32_t seq = p & 0x7fffffffu;
+  const uint32_t ahead = (seq - (g->cons + 1)) & 0x7fffffffu;   /* records queued before it */
+  if(ahead == 0 || ahead >= prod - g->cons || seq == (g->early_seq & 0x7fffffffu) || seq == g->early_no) {
+    return;
+  }
+  g->early_no = seq;         /* decided once: answered below or left in order */
+  const uint32_t a = GIO_RING + ((seq - 1) % GIO_N) * 16;
+  const uint32_t w0 = ring_rd32(g->io, a), recno = ring_rd32(g->io, a + 4);
+  if((recno & 0x7fffffffu) != seq || (w0 >> 30) != 1 || ((w0 >> 21) & 1) ||
+     (w0 & 0x1fffffu) != GIO_STATUS_DWOFF || ((w0 >> 22) & 0xffu) != GIO_STATUS_MASK) {
+    return;
+  }
+  /* GFXBUSY at the READ's position: the nearest marker before it, else today's state */
+  bool in_dma = g->in_dma;
+  for(uint32_t i = 1; i <= ahead; i++) {
+    if(i > GIO_EARLY_LOOKBACK) {
+      return;                /* inside a long run of records: leave it in order */
+    }
+    const uint32_t m = ring_rd32(g->io, GIO_RING + ((seq - 1 - i) % GIO_N) * 16);
+    if((m >> 30) == 3) {
+      in_dma = (m >> 22) & 1;
+      break;
+    }
+  }
+  if(in_dma) {
+    return;
+  }
+  const uint64_t ans = gio_access(g, g->dev, true, GIO_STATUS_DWOFF, GIO_STATUS_MASK, 0) & ~(uint64_t)REX3_STATUS_GFXBUSY;
+  g->reads++;
+  g->early_reads++;
+  g->early_seq = recno;
+  g->io.doorbell(g->io.ctx, GIO_DB_ANS_LO, (uint32_t)ans);
+  g->io.doorbell(g->io.ctx, GIO_DB_ANS_HI, (uint32_t)(ans >> 32));
+  g->io.doorbell(g->io.ctx, GIO_DB_ANS_SEQ, recno);
+}
+
 /* Drain [cons, prod).  Returns records consumed. */
 static inline uint32_t gio_poll(gio_svc_t *g) {
   const uint32_t prod = ring_rd32(g->io, GIO_PROD);
@@ -125,8 +187,14 @@ static inline uint32_t gio_poll(gio_svc_t *g) {
     return 0;
   }
   ring_rmb();
+  if(g->held_rd && prod - g->cons > 1) {
+    gio_answer_early(g, prod);
+  }
   uint32_t n = 0;
   while(g->cons != prod) {
+    if(g->held_rd && (n & 63) == 63) {
+      gio_answer_early(g, ring_rd32(g->io, GIO_PROD));   /* the READ may land mid-drain */
+    }
     const uint32_t a = GIO_RING + (g->cons % GIO_N) * 16;
     const uint32_t w0 = ring_rd32(g->io, a), recno = ring_rd32(g->io, a + 4);
     const uint64_t lanes = (uint64_t)ring_rd32(g->io, a + 8) | ((uint64_t)ring_rd32(g->io, a + 12) << 32);
@@ -179,6 +247,10 @@ static inline uint32_t gio_poll(gio_svc_t *g) {
         continue;
       }
       g->held_overflow++;     /* out of room: apply it now */
+    }
+    if(rd && g->early_seq && recno == g->early_seq) {
+      g->early_seq = 0;      /* answered by gio_answer_early() */
+      continue;
     }
     const uint64_t ans = gio_access(g, dev, rd, w0 & 0x1fffffu, (w0 >> 22) & 0xffu, lanes);
     if(g->in_dma && rd) {

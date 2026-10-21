@@ -65,9 +65,16 @@ enum {
   STATUS_BACKBUSY = (1u << 4),
   STATUS_VRINT = (1u << 5)
 };
-/* An access to an absent DCB slave (the Presenter flat-panel adapter) is a bus
- * timeout: BACKBUSY stays up ~1 ms (MAME), here 100k instructions. */
-static const uint64_t DCB_TIMEOUT_ICNT = 100000;
+/* An access to an absent DCB slave (the Presenter flat-panel adapter) never gets
+ * DCB_ACK_N, so BACKBUSY stays up.  IRIX tells "absent" from "present" only in
+ * ng1_i2cProbe: still BACKBUSY after 5 STATUS reads = absent (then a DCBRESET write).
+ * Every other PCD access -- the retrace handler re-probes the panel every 64 frames
+ * via fp_reinit -> ng1_i2cPanelID -- spins on BACKBUSY with no bound, so on real
+ * hardware it must clear soon after.  The REX3 spec gives no timeout; MAME uses 1 ms
+ * of wall clock, which cost ~4 ms of core per second under Doom.  So count STATUS
+ * reads instead: clear on the DCB_TIMEOUT_READS'th, past the probe's 5, and
+ * independent of how long a read takes on the host. */
+static const uint32_t DCB_TIMEOUT_READS = 8;
 static const uint32_t s_host_shifts[4] = { 8, 8, 16, 32 };
 
 /* ---------------- trace (NEWPORT_TRACE=<file>) ----------------
@@ -571,7 +578,7 @@ uint32_t sgi_newport::dcb_read() {
     case DCB_XMAP1: r = xmap[1].read(rex.dcb_reg_select); break;
     case DCB_PCD:
       rex.status |= STATUS_BACKBUSY;
-      backbusy_until = now() + DCB_TIMEOUT_ICNT;
+      backbusy_reads = DCB_TIMEOUT_READS;
       break;
     case DCB_RAMDAC:
     case DCB_CC1:
@@ -611,7 +618,7 @@ void sgi_newport::dcb_write(uint32_t d) {
       break;
     case DCB_PCD:
       rex.status |= STATUS_BACKBUSY;
-      backbusy_until = now() + DCB_TIMEOUT_ICNT;
+      backbusy_reads = DCB_TIMEOUT_READS;
       break;
     default:
       break;
@@ -673,8 +680,13 @@ uint64_t sgi_newport::rex3_r(uint32_t line, bool hi, bool lo) {
     case 0x1328: h = rex.clip_mode; break;
     case 0x1330: h = rex.config; break;
     case 0x1338:
-      if((rex.status & STATUS_BACKBUSY) && now() >= backbusy_until) {
-        rex.status &= ~STATUS_BACKBUSY;
+      if(rex.status & STATUS_BACKBUSY) {
+        if(backbusy_reads) {
+          backbusy_reads--;
+        }
+        if(backbusy_reads == 0) {
+          rex.status &= ~STATUS_BACKBUSY;
+        }
       }
       if(hi) {                                 /* STATUS: read acknowledges retrace */
         h = rex.status | 3;                    /* | 3 = REX3 version bits, as MAME */
@@ -930,7 +942,9 @@ void sgi_newport::rex3_w(uint32_t line, uint64_t data, uint64_t mask, bool hi, b
     case 0x1330:
       if(hi) { rex.config = h & 0x1fffff; }
       break;
-    case 0x1340:                               /* reset DCB / flush BFIFO: nothing to do */
+    case 0x1340:                               /* reset DCB / flush BFIFO: the backend is idle */
+      rex.status &= ~STATUS_BACKBUSY;
+      backbusy_reads = 0;
       break;
     default:
       if(g_np_log) {
