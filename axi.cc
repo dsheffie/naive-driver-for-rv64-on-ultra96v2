@@ -578,11 +578,29 @@ int main(int argc, char *argv[]) {
      * with lw).  'pc' still holds loadelf's e_entry here, before the --start-pc
      * override below.  Without this the FSBL jumps to a baked-in default that
      * goes stale whenever a kernel rebuild shifts the entry. */
-    c_addr[0x10C00008ULL] = (uint8_t)(pc >> 24);
-    c_addr[0x10C00009ULL] = (uint8_t)(pc >> 16);
-    c_addr[0x10C0000AULL] = (uint8_t)(pc >>  8);
-    c_addr[0x10C0000BULL] = (uint8_t)(pc      );
-    std::cout << "patched FSBL kentry slot @0x1fc00008 (dram 0x10C00008) = 0x" << std::hex << pc << std::dec << "\n";
+    /* A real SGI PROM (512 KB: ip24prom.070-9101-011.bin) loads /unix from disk
+     * itself, and offset 8 is its own code -- only henry's small FSBL has the slot. */
+    if(ast.st_size <= 65536) {
+      c_addr[0x10C00008ULL] = (uint8_t)(pc >> 24);
+      c_addr[0x10C00009ULL] = (uint8_t)(pc >> 16);
+      c_addr[0x10C0000AULL] = (uint8_t)(pc >>  8);
+      c_addr[0x10C0000BULL] = (uint8_t)(pc      );
+      std::cout << "patched FSBL kentry slot @0x1fc00008 (dram 0x10C00008) = 0x" << std::hex << pc << std::dec << "\n";
+    }
+    else {
+      std::cout << "boot image is " << ast.st_size << " bytes: a real PROM, kentry slot left alone\n";
+      /* The ds1386 bbRAM (the Indy NVRAM) is plain DRAM here (henry_soc.sv w_is_bbram):
+       * 0x1fbe0000 -> dram 0x10be0000, NVRAM byte n at +0x100 + 4n.  henry's FSBL used
+       * to write the station MAC (NVRAM 250..255); the real PROM only reads it, once at
+       * power-on, and refuses "setenv eaddr" -- so with a zeroed bbRAM IRIX gets
+       * 00:00:00:00:00:00 (ec0: bad ethernet address).  Same SGI-OUI MAC as indysim's
+       * sgi_hpc.cc rtc_read; every byte lane, as the PROM's lane is not pinned down. */
+      static const uint8_t mac[6] = {0x08, 0x00, 0x69, 0x12, 0x34, 0x56};
+      for(int i = 0; i < 6; i++) {
+        memset(c_addr + 0x10be0000ULL + 0x100 + 4 * (250 + i), mac[i], 4);
+      }
+      std::cout << "seeded bbRAM eaddr 08:00:69:12:34:56\n";
+    }
     
   }
 
@@ -1018,6 +1036,16 @@ int main(int argc, char *argv[]) {
           fflush(g_rt_file); g_rt_fills++;
           fprintf(stderr,"### REAL CRASH (%s) -- 16K window dumped (%lu entries), STOPPING.\n",why,(unsigned long)g_rt_entries);
           if(g_deeptrace) dump_dram_trace(d);
+          { /* RT_HOLD=1: keep the core (and its 2K retire ring) frozen for ~/rtdump */
+            static const bool g_hold = getenv("RT_HOLD") != nullptr;
+            if(g_hold) {
+              fprintf(stderr, "### RT_HOLD: core frozen, run ~/rtdump now (kill this process when done)\n");
+              fflush(stderr);
+              for(;;) {
+                sleep(1);
+              }
+            }
+          }
           done = true;
           }   /* end !g_characterize (full dump) */
         }
