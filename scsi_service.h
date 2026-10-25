@@ -16,6 +16,9 @@
  */
 #ifndef SCSI_SERVICE_H
 #define SCSI_SERVICE_H
+#ifdef HAVE_CHD
+#include "chd_reader.hh"
+#endif
 #include "henry_scsi.h"
 #include <cstdio>
 #include <cstdlib>
@@ -34,6 +37,9 @@ typedef uint8_t *(*scsi_mem_fn)(void *ctx, uint32_t phys, uint32_t len);
 struct scsi_disk {
   int      fd = -1, mode = -1;
   uint64_t nblocks = 0;
+#ifdef HAVE_CHD
+  chd_reader *chd = nullptr;   /* read-only MAME CHD base image (writes stay in the overlay) */
+#endif
   std::map<uint64_t, std::array<uint8_t,512>> overlay;   /* COW writes */
 
   /* traffic counters -- reported by the monitor "diskstat" command.  Writes go
@@ -57,16 +63,41 @@ struct scsi_disk {
     }
     struct stat st;
     if(::fstat(fd, &st) == 0) nblocks = (uint64_t)st.st_size / 512;
+#ifdef HAVE_CHD
+    uint8_t magic[8];
+    if(::pread(fd, magic, 8, 0) == 8 && chd_reader::is_magic(magic)) {
+      chd = new chd_reader();
+      if(!chd->open(fd)) {
+        delete chd;
+        chd = nullptr;
+        fprintf(stderr, "scsi_disk: %s: CHD open failed\n", path);
+        return false;
+      }
+      nblocks = chd->virtual_size() / 512;
+      mode = O_RDONLY;   /* never write back into a compressed image: flush() refuses */
+    }
+#endif
     fprintf(stderr, "scsi_disk: %s -- %llu blocks (%llu MB)\n", path,
 	    (unsigned long long)nblocks, (unsigned long long)(nblocks/2048));
     return true;
   }
   bool ok() const { return fd >= 0; }
 
+  /* one block of the base image (CHD or raw), no overlay */
+  bool base_read(uint64_t lba, uint8_t *dst) {
+#ifdef HAVE_CHD
+    if(chd) {
+      chd->read_block(lba, dst);
+      return true;
+    }
+#endif
+    return ::pread(fd, dst, 512, (off_t)lba * 512) == 512;
+  }
+
   void block_read(uint64_t lba, uint8_t *dst) {           /* overlay wins, else image, else zero */
     static const bool g_scsi_synth = getenv("SCSI_SYNTH") != nullptr;
     if(g_scsi_synth) {   /* experiment: per-LBA sentinel content [DA 7A hi lo] */
-      if(lba < nblocks) { ssize_t r = ::pread(fd, dst, 512, (off_t)lba * 512); (void)r; }  /* keep real read latency */
+      if(lba < nblocks) { base_read(lba, dst); }  /* keep real read latency */
       for(int i = 0; i < 512; i += 4) {
 	dst[i]=0xDA; dst[i+1]=0x7A; dst[i+2]=(uint8_t)(lba>>8); dst[i+3]=(uint8_t)lba;
       }
@@ -79,7 +110,7 @@ struct scsi_disk {
       memcpy(dst, it->second.data(), 512);
       return;
     }
-    if(lba < nblocks && ::pread(fd, dst, 512, (off_t)lba * 512) == 512) {
+    if(lba < nblocks && base_read(lba, dst)) {
       n_rd_image++;
       return;
     }
@@ -105,10 +136,10 @@ struct scsi_disk {
     auto be32 = [](const uint8_t*p){ return (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<8 | p[3]; };
     auto be64 = [](const uint8_t*p){ uint64_t v=0; for(int i=0;i<8;i++) v=(v<<8)|p[i]; return v; };
     uint8_t vh[512];
-    if(::pread(fd, vh, 512, 0) != 512) return;
+    if(!base_read(0, vh)) return;
     uint32_t p0 = be32(vh + 0x138 + 4);                       /* SGI vh: partition 0 first_lba */
     uint8_t sb[512];
-    if(::pread(fd, sb, 512, (off_t)p0 * 512) != 512) return;
+    if(!base_read(p0, sb)) return;
     if(!(sb[0]=='X' && sb[1]=='F' && sb[2]=='S' && sb[3]=='B')) return;   /* not XFS -> guard stays off */
     uint32_t blocksize = be32(sb+4), agblocks = be32(sb+0x54), agcount = be32(sb+0x58);
     uint32_t logblocks = be32(sb+0x60); uint8_t agblklog = sb[0x7c];

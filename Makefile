@@ -10,6 +10,14 @@ ifneq ($(wildcard /usr/include/X11/Xlib.h),)
 CXXFLAGS += -DNEWPORT_X11
 LIBS += -lX11
 endif
+# MAME CHD disk images (--disk foo.chd): needs a built libchdr (vendored in indysim);
+# point CHD_DIR at it.  Without it mips-axi takes raw images only.
+CHD_DIR ?= libchdr
+ifneq ($(wildcard $(CHD_DIR)/build/libchdr-static.a),)
+CXXFLAGS += -DHAVE_CHD -I$(CHD_DIR)/include
+OBJ += chd_reader.o
+LIBS += $(CHD_DIR)/build/libchdr-static.a $(wildcard $(CHD_DIR)/build/deps/zlib-*/libz.a) $(wildcard $(CHD_DIR)/build/deps/lzma-*/liblzma.a) $(wildcard $(CHD_DIR)/build/deps/zstd-*/build/cmake/lib/libzstd.a)
+endif
 .PHONY: all clean
 
 all: $(EXE) mipsmon
