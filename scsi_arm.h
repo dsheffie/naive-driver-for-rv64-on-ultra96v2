@@ -35,6 +35,14 @@
 #include <cstdio>
 #include <map>             // write->read round-trip map (SCSIHASH diag)
 #include <ctime>           // completion timeout
+
+/* SCSI_RDCHK=1: after each READ chain completes, walk its descriptor chain in guest
+ * DRAM and compare every landed byte with the disk bytes we served (henry_tb's
+ * scsi_read_check, on silicon).  Guest PA 0x08000000-0x17ffffff is window offset
+ * PA & 0x0fffffff; the window base is the staging pointer minus RING_STG_PA. */
+static long g_rdchk_reads = 0, g_rdchk_bad = 0;
+static void scsi_read_check(const std::vector<uint8_t> &buf, size_t pos, size_t len,
+                            uint32_t nbdp, uint64_t lba);
 #include "ring_service.h"  // staging rings (docs/arm-device-protocol.md), shared with henry_tb
 
 enum {
@@ -59,6 +67,64 @@ static inline void scsi_idle(uint64_t spin) {
   }
 }
 static scsi_ring_t g_sring;
+
+static void scsi_read_check(const std::vector<uint8_t> &buf, size_t pos, size_t len,
+                            uint32_t nbdp, uint64_t lba) {
+  volatile uint8_t *win = g_sring.io.stg - RING_STG_PA;
+  auto map = [](uint32_t pa, bool *ok) -> uint32_t {
+    *ok = (pa >= 0x08000000u && pa <= 0x17ffffffu);
+    return pa & 0x0fffffffu;
+  };
+  auto be32 = [win](uint32_t off) -> uint32_t {
+    return ((uint32_t)win[off] << 24) | ((uint32_t)win[off + 1] << 16) |
+           ((uint32_t)win[off + 2] << 8) | (uint32_t)win[off + 3];
+  };
+  const uint32_t nbdp0 = nbdp;
+  size_t off = 0;
+  long bad = 0;
+  uint32_t first_pa = 0;
+  size_t first_off = 0;
+  uint8_t first_got = 0, first_want = 0;
+  for(int guard = 0; guard < 256 && off < len; guard++) {
+    bool ok = false;
+    uint32_t d = map(nbdp, &ok);
+    if(!ok) {
+      break;
+    }
+    uint32_t bp = be32(d), bc = be32(d + 4), dp = be32(d + 8);
+    size_t cnt = bc & 0x3fff;
+    for(size_t i = 0; i < cnt && off < len; i++, off++) {
+      uint32_t a = map(bp + (uint32_t)i, &ok);
+      if(!ok) {
+        break;
+      }
+      if(win[a] != buf[pos + off]) {
+        if(bad == 0) {
+          first_pa = bp + (uint32_t)i;
+          first_off = off;
+          first_got = win[a];
+          first_want = buf[pos + off];
+        }
+        bad++;
+      }
+    }
+    if((bc & 0x80000000u) || dp == 0) {
+      break;
+    }
+    nbdp = dp;
+  }
+  g_rdchk_reads++;
+  if(bad) {
+    g_rdchk_bad++;
+    if(g_rdchk_bad <= 50) {
+      fprintf(stderr, "[scsi-rdchk] MISMATCH lba=%llu %ld/%zu bytes, first pa=%08x (stream off %zu) got %02x want %02x, nbdp=%08x\n",
+              (unsigned long long)lba, bad, off, first_pa, first_off, first_got, first_want, nbdp0);
+    }
+  }
+  if((g_rdchk_reads & 63) == 0) {
+    fprintf(stderr, "[scsi-rdchk] %ld reads checked, %ld mismatched\n", g_rdchk_reads, g_rdchk_bad);
+  }
+}
 static uint64_t g_sr_timeout = 0;
 
 static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk) {
@@ -97,6 +163,7 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk) {
    * pause/resumes >252KB transfers; {buf,pos,total} persist between doorbells, and a
    * doorbell arriving mid-transfer is a RESUME (same buf, new chain from req.nbdp).
    * Mirrors interp_mips select_and_transfer()/pause_transfer(). */
+  static const bool g_rdchk = getenv("SCSI_RDCHK") != nullptr;
   static std::vector<uint8_t> g_buf;
   static size_t   g_pos = 0, g_total = 0;
   static bool     g_active = false, g_to_dev = false;
@@ -142,6 +209,9 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk) {
       if(g_to_dev) {
         scsi_ring_read_wr(&g_sring, g_buf.data() + g_pos, moved);
       }
+      else if(g_rdchk) {
+        scsi_read_check(g_buf, g_pos, moved, e.nbdp, g_hlba);
+      }
     }
     else {
       g_sr_timeout++;
@@ -159,6 +229,18 @@ static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk) {
       size_t nb = moved / 512, base = g_pos / 512;
       for(size_t b = 0; b < nb; b++) {
         disk->block_write(g_wr_lba + base + b, g_buf.data() + g_pos + b * 512);
+      }
+      { /* SCSIWDUMP=<file>: append every written block as {uint64 lba (LE), 512 bytes},
+         * the same format as indysim's, to diff guest writes block by block */
+        static FILE *g_wd = getenv("SCSIWDUMP") ? fopen(getenv("SCSIWDUMP"), "wb") : nullptr;
+        if(g_wd) {
+          for(size_t b = 0; b < nb; b++) {
+            uint64_t l = g_wr_lba + base + b;
+            fwrite(&l, 8, 1, g_wd);
+            fwrite(g_buf.data() + g_pos + b * 512, 512, 1, g_wd);
+          }
+          fflush(g_wd);
+        }
       }
     }
     if(g_scsihash) {                             /* FNV-1a payload hash: WRITE gathered / READ staged */
