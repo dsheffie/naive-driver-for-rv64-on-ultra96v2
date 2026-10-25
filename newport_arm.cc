@@ -67,7 +67,7 @@ static std::atomic<bool> g_stop(false);
 /* heap-allocated and never destroyed: an exit() elsewhere in mips-axi must not run
  * ~thread on a joinable thread (std::terminate) */
 static std::thread *g_svc_thread = nullptr, *g_x11_thread = nullptr;
-static uint64_t g_vblanks = 0, g_naps = 0, g_frames = 0, g_puts = 0;
+static uint64_t g_vblanks = 0, g_naps = 0, g_frames = 0, g_puts = 0, g_skipped = 0;
 
 /* Idle back-off.  A READ holds the MIPS core until we answer it, so every nap that
  * a READ lands in is pure core stall: Doom under Xsgi spent 6% of the core in the
@@ -232,6 +232,7 @@ static void x11_main(std::string disp) {
   std::vector<uint32_t> cur((size_t)w * h), prev((size_t)w * h, 0);
   XImage *img = XCreateImage(dpy, vis, 24, ZPixmap, 0, reinterpret_cast<char *>(cur.data()), w, h, 32, w * 4);
   bool full = true;
+  uint64_t last_gen = ~0ULL;
   struct timespec next;
   clock_gettime(CLOCK_MONOTONIC, &next);
   fprintf(stderr, "[newport] window on %s\n", disp.c_str());
@@ -297,6 +298,23 @@ static void x11_main(std::string disp) {
       acc_dx = 0;
       acc_dy = 0;
     }
+    /* nothing written to the board since the last frame we drew: the picture is
+     * unchanged, so skip the full-frame render + diff (25 Hz of A53 work otherwise).
+     * Read the generation BEFORE render: a write landing mid-render moves it again,
+     * so the next tick redraws */
+    const uint64_t gen = g_np->display_gen();
+    if(!full && gen == last_gen) {
+      g_frames++;
+      g_skipped++;
+      next.tv_nsec += FRAME_NS;
+      if(next.tv_nsec >= 1000000000) {
+        next.tv_sec++;
+        next.tv_nsec -= 1000000000;
+      }
+      clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
+      continue;
+    }
+    last_gen = gen;
     g_np->render(cur.data());
     int y0 = 0, y1 = h - 1;
     if(!full) {
@@ -399,10 +417,10 @@ void newport_arm_stop() {
     g_x11_thread->join();
   }
   fprintf(stderr, "[newport] %llu stores, %llu reads, %llu split, %llu bad recno; %llu vblanks, %llu naps; "
-          "window %llu frames, %llu puts\n",
+          "window %llu frames (%llu unchanged, not rendered), %llu puts\n",
           (unsigned long long)g_gio.stores, (unsigned long long)g_gio.reads, (unsigned long long)g_gio.split,
           (unsigned long long)g_gio.bad_recno, (unsigned long long)g_vblanks, (unsigned long long)g_naps,
-          (unsigned long long)g_frames, (unsigned long long)g_puts);
+          (unsigned long long)g_frames, (unsigned long long)g_skipped, (unsigned long long)g_puts);
   delete g_np;                       /* NEWPORT_PPM: the final frame */
   g_np = nullptr;
 }

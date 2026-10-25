@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <atomic>
 #include <vector>
 #include <unordered_map>
 
@@ -32,6 +33,10 @@ struct np_host_t {
  * ISS state_t / SDL / PS/2 hooks replaced by np_host_t; keep the two bit-exact. */
 class sgi_newport {
 public:
+  /* bumped on every guest/DMA write to the board (REX3, DCB: cmap/xmap/vc2 cursor)
+   * and on state restore -- the picture can only change when this moves.  Atomic:
+   * the GIO service thread writes, the X11 display thread reads */
+  uint64_t display_gen() const { return disp_gen.load(std::memory_order_acquire); }
   static const uint32_t BASE = 0x1f0f0000u;
   static const uint32_t SIZE = 0x2000u;
   static const uint32_t FB_W = 1280 + 64;     /* RB2 line pitch (pixels) */
@@ -164,6 +169,7 @@ private:
   uint64_t next_vblank = 0;
   uint64_t vblank_period = 0;
   uint64_t nframes = 0;
+  std::atomic<uint64_t> disp_gen{0};
   uint32_t backbusy_reads = 0;   /* STATUS reads until an absent-slave DCB access clears BACKBUSY */
   bool in_dma = false;            /* accesses come from the MC graphics DMA engine */
   uint64_t go_pixels = 0;         /* pixels produced by the stepper (trace) */

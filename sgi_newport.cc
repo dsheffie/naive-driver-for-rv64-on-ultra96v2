@@ -195,6 +195,7 @@ void sgi_newport::set_rb(const rb_snap_t &r) {
 
 void sgi_newport::set_state(const uint8_t *rex_in, const rb_snap_t &r) {
   memcpy(&rex, rex_in, sizeof(rex));
+  disp_gen.fetch_add(1, std::memory_order_release);
   set_rb(r);
 }
 
@@ -460,7 +461,13 @@ sgi_newport::sgi_newport(const np_host_t &host, uint64_t vblank_period) : host(h
   rb.global_mask = g_xl24 ? 0x00ffffffu : 0x000000ffu;
   for(int i = 0; i < 2; i++) {
     xmap[i].revision = g_xl24 ? 3 : 1;
-    cmap[i].revision = g_xl24 ? 0x02 : 0xa1;
+    /* CMAP revision byte, as the IP24 PROM and Linux newport_con decode it: bit 7 = 8-bit
+     * board, bits 6:4 = board revision, bits 2:0 = CMAP revision.  The PROM only trusts
+     * the 8/24-bit flag (and sets up 1280x1024) at board revision >= 2: MAME's XL24 0x02
+     * (rev 0) gave a 1024x768 setup, and 0xa2 (bit 7 set) made hinv say "Indy 8-bit".
+     * CMAP1's upper nibble is the monitor-ID sense instead (0xa = 1280x1024).
+     * Keep in step with indysim sgi_newport.cc. */
+    cmap[i].revision = g_xl24 ? (i == 0 ? 0x22 : 0xa2) : 0xa1;
     cmap[i].pal = new uint32_t[0x10000]();
   }
   vc2.ram = new uint16_t[VC2_RAM_SIZE]();
@@ -549,6 +556,7 @@ uint64_t sgi_newport::read(uint32_t offs, size_t sz) {
 }
 
 void sgi_newport::write(uint32_t offs, uint64_t v, size_t sz) {
+  disp_gen.fetch_add(1, std::memory_order_release);
   uint64_t g = 0;
   switch(sz)
     {
@@ -2212,7 +2220,7 @@ void sgi_newport::render(uint32_t *dst) {
             default: out = 0; break;
             }
         }
-        else if(pix_mode == 1) {               /* RGB map 0 (BGR in the framebuffer) */
+        else {                                 /* RGB maps 0/1/2 (BGR in the framebuffer) */
           uint32_t rgb = 0;
           switch(pix_size)
             {
@@ -2222,9 +2230,16 @@ void sgi_newport::render(uint32_t *dst) {
             default: rgb = c & 0xffffff; break;
             }
           out = ((rgb & 0xff) << 16) | (rgb & 0xff00) | ((rgb >> 16) & 0xff);
-        }
-        else {
-          out = (pix_mode == 2) ? 0xff00ff : 0x00ff00;   /* RGB maps 1/2: unsupported, as MAME */
+          /* XMAP9 spec 4.2: an RGB pixel goes through the CMAP one component at a time --
+           * red indexes the red byte of map entry ci_msb + R (0x1d00/0x1e00/0x1f00 for
+           * maps 0/1/2), green and blue likewise.  Maps 1/2 are the guest's gamma tables
+           * (MAME painted them solid green/magenta); map 0 stays direct for now.  Keep in
+           * step with indysim sgi_newport.cc. */
+          if(pix_mode != 1) {
+            out = (pal[ci_msb | ((out >> 16) & 0xff)] & 0xff0000) |
+                  (pal[ci_msb | ((out >> 8) & 0xff)] & 0x00ff00) |
+                  (pal[ci_msb | (out & 0xff)] & 0x0000ff);
+          }
         }
       }
       d[x] = lut_r[(out >> 16) & 0xff] | lut_g[(out >> 8) & 0xff] | lut_b[out & 0xff];
