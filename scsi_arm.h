@@ -127,9 +127,41 @@ static void scsi_read_check(const std::vector<uint8_t> &buf, size_t pos, size_t 
 }
 static uint64_t g_sr_timeout = 0;
 
+/* The shim only forwards Select-And-Transfer (0x08/0x09) to this service.  The
+ * Linux wd33c93 driver opens every target with Select-with-ATN (0x06) and steps the
+ * bus phases itself, which the shim drops: each command times out and the guest
+ * resets the controller to recover.  The shim has no command latch to report it
+ * (and is not worth LUTs), so infer it from what it does count: controller resets
+ * (SCSI_R_DBG [31:28], saturating at 15) climbing while the doorbell stands still.
+ * Fix on the guest side: force sync_stat to SS_SET in wd33c93.c so it uses 0x08
+ * (the henry patch in linux-mips-ip22-64k).  Read the debug word only every 64K
+ * polls -- this runs every pass of the main loop. */
+static inline void scsi_check_sel_atn(Driver *d, uint32_t seq) {
+  static uint32_t polls = 0, seq_at = 0, resets_at = 0;
+  static bool warned = false;
+  if(warned || (++polls & 0xffffu) != 0) {
+    return;
+  }
+  const uint32_t resets = (d->read32(SCSI_R_DBG) >> 28) & 0xfu;
+  if(seq != seq_at) {
+    seq_at = seq;
+    resets_at = resets;
+    return;
+  }
+  if(resets >= resets_at + 3) {
+    warned = true;
+    fprintf(stderr, "\n[scsi] ERROR: the guest has reset the WD33C93 %u times without a "
+                    "Select-and-Transfer -- it is most likely using Select-with-ATN (0x06), "
+                    "which this SCSI shim does not support (Linux wd33c93: patch sync_stat to "
+                    "SS_SET so it uses 0x08).  Its SCSI commands will all time out.\n",
+            resets - resets_at);
+  }
+}
+
 static inline bool scsi_arm_poll(Driver *d, scsi_disk *disk) {
   static uint32_t last_seq = 0;
   uint32_t seq = d->read32(SCSI_R_SEQ);
+  scsi_check_sel_atn(d, seq);
   if(seq == last_seq) return false;
   last_seq = seq;
 
